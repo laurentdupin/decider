@@ -194,6 +194,38 @@ device index before process startup. Obtain the indices from
 $env:GGML_VK_VISIBLE_DEVICES = '0'
 ```
 
+## Decider 4B v2.1 status
+
+The harness is not tied to the 2B dimensions. The current
+[`Mapika/decider-4b`](https://huggingface.co/Mapika/decider-4b) v2.1 checkpoint
+(Hub commit `eb5fbdfc9448473ec25e399882912863afbdb70e`) was exported with the
+same command and loaded without source changes. It is a 4.2B-parameter model;
+the BF16 safetensors and GGUF payloads are 8.41 GB decimal (7.83 GiB).
+
+The packed conformance probe passed against a Transformers BF16 CPU fixture on
+both GPUs large enough for full offload. Maximum
+`(logit, probability, rounded-response)` deltas were
+`(0.05660, 0.00328, 0.0033)` on the RX 9070 and
+`(0.03873, 0.00319, 0.0032)` on the RX 6700 XT. Tokens, slots, label IDs,
+usage, object structure, and categorical answers were exact.
+
+After shader-cache warm-up, three fresh-process runs produced these median
+inference times:
+
+| Example | RX 9070 | RX 6700 XT |
+| --- | ---: | ---: |
+| `simple_choice.json` | `93.20 ms` | `177.76 ms` |
+| `simple_noul.json` | `92.54 ms` | `170.50 ms` |
+| `simple_score.json` | `87.88 ms` | `178.39 ms` |
+
+Fresh-process model loading was approximately `4.8 s`; a persistent InferBridge
+runtime pays it once. Full BF16 offload does not fit the 8 GB GTX 1080 and
+correctly fails with a Vulkan out-of-device-memory error. Leaving all Vulkan
+GPUs visible allows llama.cpp to split the 4B model across them successfully.
+A quantized 4B artifact would fit the GTX 1080, but it must pass separate
+quality and calibration evaluation before being published as interchangeable
+with the BF16 model.
+
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
 `VULKAN` as the final argument only in a build configured with
 `-DDECIDER_LLAMA_VULKAN=ON`; the harness now fails early when no Vulkan GPU
