@@ -123,6 +123,10 @@ InferBridge submissions.
 Use `--output out\parity\native.json` to write the canary response directly to
 a comparison fixture.
 
+Use `--model-parameters` to pass the JSON object supplied to InferBridge's
+`model_load`. This is useful for memory-bound quantized models; for example,
+`--model-parameters '{"context_size":4096,"batch_size":256,"threads":8}'`.
+
 For a packaged vision model, pass a PNG, JPEG, BMP, or other stb-supported
 image to the canary. The canary decodes it to RGBA8 and submits the JSON and
 image as separate InferBridge bindings:
@@ -289,6 +293,34 @@ GPUs visible allows llama.cpp to split the 4B model across them successfully.
 A quantized 4B artifact would fit the GTX 1080, but it must pass separate
 quality and calibration evaluation before being published as interchangeable
 with the BF16 model.
+
+## Unsloth 27B quantized runtime probe
+
+The multimodal path was also exercised with the official
+[`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
+repository at Hub commit `4ca720788d1e01f1bff70c033e0d0028fd02e502`.
+The tested package combines `Qwen3.8-27B-UD-IQ2_XXS.gguf` (7.27 GB decimal)
+with `mmproj-BF16.gguf` (0.93 GB decimal) and uses a 4,096-token context.
+
+On the same `media/cover.png` mixed image-and-text request, both AMD GPUs
+selected `food`:
+
+| GPU | Option probability | Model load | Inference |
+| --- | ---: | ---: | ---: |
+| RX 9070 | `0.9943` | `5.13 s` | `7.48 s` |
+| RX 6700 XT | `0.9941` | `5.28 s` | `39.34 s` |
+| GTX 1080 8 GB | n/a | out of memory | n/a |
+
+The request contained 1,703 text-plus-image tokens. The GTX 1080 remained out
+of memory even with a 2,048-token context, because the language quant,
+projector, context, and compute buffers must all fit in its 8 GB allocation.
+
+This proves that the InferBridge adapter and pinned llama.cpp can execute the
+Unsloth 27B quant and its image projector. It is deliberately labelled a
+runtime probe: this stock Qwen checkpoint is not Decider-fine-tuned or
+temperature-calibrated, so its letter logits must not be treated as a validated
+drop-in Decider classifier. A Decider-trained 27B Unsloth quant would need the
+same parity and quality evaluation used for the released 2B and 4B models.
 
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
 `VULKAN` as the final argument only in a build configured with
