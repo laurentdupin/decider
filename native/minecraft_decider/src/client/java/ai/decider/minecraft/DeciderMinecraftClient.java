@@ -52,6 +52,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private int actionTicks;
     private String activeAction = "stop";
     private boolean announced;
+    private long retryAfterNanos;
 
     @Override
     public void onInitializeClient() {
@@ -98,6 +99,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         }
 
         if (++tick % DECISION_INTERVAL_TICKS == 0 &&
+            System.nanoTime() >= retryAfterNanos &&
             requestPending.compareAndSet(false, true)) {
             JsonObject request = buildRequest(client, player, activeAction);
             inference.submit(() -> decide(request));
@@ -121,6 +123,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
                 Duration.ofNanos(System.nanoTime() - started)));
         } catch (Exception exception) {
             failure.set(exception.getClass().getSimpleName() + ": " + exception.getMessage());
+            retryAfterNanos = System.nanoTime() + Duration.ofSeconds(10).toNanos();
             if (runner != null) runner.close();
             runner = null;
         } finally {
@@ -268,14 +271,22 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
                 configuration.backend(), "--model-parameters",
                 GSON.toJson(parameters), "--ready");
             builder.environment().put("GGML_VK_VISIBLE_DEVICES", configuration.gpu());
-            builder.redirectError(ProcessBuilder.Redirect.INHERIT);
+            builder.directory(FabricLoader.getInstance().getGameDir().toFile());
+            builder.redirectErrorStream(true);
             Runner runner = new Runner(builder.start());
-            String ready = runner.output.readLine();
-            if (!"{\"ready\":true}".equals(ready)) {
-                runner.close();
-                throw new IOException("native runner did not become ready");
+            StringBuilder diagnostics = new StringBuilder();
+            for (int lineCount = 0; lineCount < 64; lineCount++) {
+                String line = runner.output.readLine();
+                if ("{\"ready\":true}".equals(line)) return runner;
+                if (line == null) break;
+                if (!line.isBlank()) {
+                    if (!diagnostics.isEmpty()) diagnostics.append(" | ");
+                    diagnostics.append(line);
+                }
             }
-            return runner;
+            runner.close();
+            throw new IOException("native runner exited before ready" +
+                (diagnostics.isEmpty() ? "" : ": " + diagnostics));
         }
 
         synchronized JsonObject exchange(String request) throws IOException {
