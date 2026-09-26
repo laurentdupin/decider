@@ -3,6 +3,8 @@
 #include <inferbridge/inferbridge_harness.h>
 #include <ggml-backend.h>
 #include <llama.h>
+#include <mtmd-helper.h>
+#include <mtmd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -64,6 +66,11 @@ void capture_llama_log(ggml_log_level, const char* message, void*) {
     constexpr std::size_t maximum = 32U * 1024U;
     if (g_llama_log.size() > maximum)
         g_llama_log.erase(0, g_llama_log.size() - maximum);
+}
+
+void capture_mtmd_log(ggml_log_level level, const char* message, void* user_data) {
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR)
+        capture_llama_log(level, message, user_data);
 }
 
 void clear_llama_log() {
@@ -227,6 +234,23 @@ std::vector<llama_token> tokenize(const llama_vocab* vocabulary, const std::stri
     return tokens;
 }
 
+std::string detokenize(const llama_vocab* vocabulary,
+                       const std::vector<llama_token>& tokens) {
+    if (tokens.empty()) return {};
+    int count = llama_detokenize(vocabulary, tokens.data(),
+        static_cast<int>(tokens.size()), nullptr, 0, false, false);
+    if (count == std::numeric_limits<int>::min())
+        throw std::runtime_error("token sequence is too large to detokenize");
+    if (count >= 0) return {};
+    std::string text(static_cast<std::size_t>(-count), '\0');
+    count = llama_detokenize(vocabulary, tokens.data(),
+        static_cast<int>(tokens.size()), text.data(), static_cast<int>(text.size()),
+        false, false);
+    if (count < 0) throw std::runtime_error("llama.cpp detokenization failed");
+    text.resize(static_cast<std::size_t>(count));
+    return text;
+}
+
 std::vector<std::string> candidate_label_names() {
     std::vector<std::string> names;
     names.reserve(26 + 26 * 26);
@@ -256,6 +280,22 @@ void fill_text_port(std::uint32_t direction, std::uint32_t width,
     descriptor->accepted_pixel_format_mask = 1ULL << IBRH_PAYLOAD_UTF8_JSON;
 }
 
+void fill_image_port(ibrh_port_descriptor* descriptor) {
+    *descriptor = {};
+    descriptor->struct_size = sizeof(*descriptor);
+    descriptor->api_version = IBRH_CURRENT_API_VERSION;
+    descriptor->index = 1;
+    descriptor->direction = IBRH_PORT_INPUT;
+    descriptor->semantic = IBRH_SEMANTIC_IMAGE;
+    descriptor->payload_type = IBRH_PIXEL_RGBA8;
+    descriptor->pixel_format = IBRH_PIXEL_RGBA8;
+    descriptor->resource_kind = IBRH_RESOURCE_KIND_IMAGE_2D;
+    descriptor->depth = 1;
+    descriptor->flags = IBRH_DESCRIPTOR_DYNAMIC_WIDTH | IBRH_DESCRIPTOR_DYNAMIC_HEIGHT;
+    descriptor->accepted_pixel_format_mask =
+        (1ULL << IBRH_PIXEL_RGBA8) | (1ULL << IBRH_PIXEL_BGRA8);
+}
+
 void validate_host_json_binding(const ibrh_transfer_binding& binding,
                                 std::uint32_t access) {
     const auto& resource = binding.resource;
@@ -271,6 +311,29 @@ void validate_host_json_binding(const ibrh_transfer_binding& binding,
         resource.native_handle == 0 || resource.byte_size == 0 ||
         resource.byte_offset > std::numeric_limits<std::uint64_t>::max() - resource.byte_size)
         throw std::invalid_argument("expected one host UTF-8 JSON buffer binding");
+}
+
+void validate_host_image_binding(const ibrh_transfer_binding& binding) {
+    const auto& resource = binding.resource;
+    const std::uint64_t tight_row = static_cast<std::uint64_t>(resource.width) * 4U;
+    const std::uint64_t required = resource.height == 0 ? 0 :
+        static_cast<std::uint64_t>(resource.row_stride_bytes) * (resource.height - 1U) + tight_row;
+    if (binding.struct_size < sizeof(binding) ||
+        binding.api_version != IBRH_CURRENT_API_VERSION ||
+        resource.struct_size < sizeof(resource) ||
+        resource.api_version != IBRH_CURRENT_API_VERSION ||
+        resource.domain != IBRH_RESOURCE_DOMAIN_HOST ||
+        resource.kind != IBRH_RESOURCE_KIND_IMAGE_2D ||
+        resource.access != IBRH_RESOURCE_ACCESS_READ ||
+        (resource.pixel_format != IBRH_PIXEL_RGBA8 &&
+         resource.pixel_format != IBRH_PIXEL_BGRA8) ||
+        resource.native_handle_type != IBRH_NATIVE_HANDLE_HOST_POINTER ||
+        resource.native_handle == 0 || resource.width == 0 || resource.height == 0 ||
+        resource.width > 16384 || resource.height > 16384 ||
+        resource.depth != 1 || resource.row_stride_bytes < tight_row ||
+        required > resource.byte_size ||
+        resource.byte_offset > std::numeric_limits<std::uint64_t>::max() - resource.byte_size)
+        throw std::invalid_argument("expected one host RGBA8 or BGRA8 image binding");
 }
 
 double temperature_for(const ModelConfig& config, decider::native::AnswerType type) {
@@ -336,10 +399,17 @@ struct ibrh_model {
     ibrh_runtime* runtime = nullptr;
     llama_model* model = nullptr;
     llama_context* context = nullptr;
+    mtmd_context* multimodal = nullptr;
     const llama_vocab* vocabulary = nullptr;
     ModelConfig config;
     std::vector<llama_token> labels;
     std::atomic<bool> active{false};
+};
+
+struct ImageInput {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::vector<unsigned char> rgb;
 };
 
 struct ibrh_job {
@@ -364,6 +434,7 @@ struct PreparedRow {
 struct EvaluatedRow {
     std::vector<std::vector<double>> probabilities;
     std::vector<std::vector<double>> selected_logits;
+    std::size_t input_tokens = 0;
 };
 
 void append_prompt_block(const ibrh_model* model, PreparedRow& prepared,
@@ -403,6 +474,7 @@ EvaluatedRow evaluate_row(ibrh_job* job, const PreparedRow& row) {
         throw std::logic_error("Decider prompt slot metadata is inconsistent");
     llama_memory_clear(llama_get_memory(model->context), true);
     EvaluatedRow evaluated;
+    evaluated.input_tokens = row.tokens.size();
     evaluated.probabilities.reserve(row.slots.size());
     evaluated.selected_logits.reserve(row.slots.size());
     std::size_t offset = 0;
@@ -457,7 +529,130 @@ EvaluatedRow evaluate_row(ibrh_job* job, const PreparedRow& row) {
     return evaluated;
 }
 
-void run_job(ibrh_job* job, std::string request_text,
+EvaluatedRow evaluate_vision_row(ibrh_job* job, const PreparedRow& row,
+                                 const ImageInput& image) {
+    ibrh_model* model = job->model;
+    if (model->multimodal == nullptr)
+        throw std::logic_error("vision evaluation requires a multimodal model");
+    llama_memory_clear(llama_get_memory(model->context), true);
+
+    const std::string marker = mtmd_get_marker(model->multimodal);
+    const std::string prompt = marker + detokenize(model->vocabulary, row.tokens);
+    mtmd_input_text input_text{};
+    input_text.text = prompt.data();
+    input_text.text_len = prompt.size();
+    input_text.add_special = false;
+    input_text.parse_special = true;
+    mtmd::bitmap bitmap(image.width, image.height, image.rgb.data());
+    if (!bitmap.ptr) throw std::runtime_error("failed to construct multimodal bitmap");
+    const mtmd_bitmap* bitmaps[] = {bitmap.ptr.get()};
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    const int tokenized = mtmd_tokenize(model->multimodal, chunks.ptr.get(),
+                                        &input_text, bitmaps, 1);
+    if (tokenized != 0)
+        throw std::runtime_error("multimodal prompt tokenization failed with code " +
+                                 std::to_string(tokenized));
+    if (mtmd_helper_get_n_pos(chunks.ptr.get()) > model->config.context_size)
+        throw std::runtime_error("multimodal Decider prompt exceeds context_size");
+
+    EvaluatedRow evaluated;
+    evaluated.input_tokens = mtmd_helper_get_n_tokens(chunks.ptr.get());
+    evaluated.probabilities.reserve(row.slots.size());
+    evaluated.selected_logits.reserve(row.slots.size());
+    llama_pos n_past = 0;
+    bool prompt_chunk_seen = false;
+    for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+        if (job->cancel.load()) throw std::runtime_error("cancelled");
+        const mtmd_input_chunk* chunk = chunks[chunk_index];
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            llama_pos next = n_past;
+            const int result = mtmd_helper_eval_chunk_single(
+                model->multimodal, model->context, chunk, n_past, 0,
+                static_cast<int>(model->config.batch_size), false, &next);
+            if (result != 0)
+                throw std::runtime_error("multimodal image evaluation failed with code " +
+                                         std::to_string(result));
+            n_past = next;
+            continue;
+        }
+
+        std::size_t token_count = 0;
+        const llama_token* token_data = mtmd_input_chunk_get_tokens_text(chunk, &token_count);
+        const auto found = std::search(token_data, token_data + token_count,
+                                       row.tokens.begin(), row.tokens.end());
+        if (found == token_data + token_count) {
+            llama_pos next = n_past;
+            const int result = mtmd_helper_eval_chunk_single(
+                model->multimodal, model->context, chunk, n_past, 0,
+                static_cast<int>(model->config.batch_size), false, &next);
+            if (result != 0)
+                throw std::runtime_error("multimodal text evaluation failed with code " +
+                                         std::to_string(result));
+            n_past = next;
+            continue;
+        }
+        if (prompt_chunk_seen)
+            throw std::runtime_error("multimodal prompt appeared in more than one chunk");
+        prompt_chunk_seen = true;
+        const std::size_t prompt_offset = static_cast<std::size_t>(found - token_data);
+        std::vector<std::size_t> slots;
+        slots.reserve(row.slots.size());
+        for (const std::size_t slot : row.slots) slots.push_back(prompt_offset + slot);
+
+        std::size_t offset = 0;
+        std::size_t next_slot = 0;
+        while (offset < token_count) {
+            std::size_t end = std::min<std::size_t>(
+                offset + model->config.batch_size, token_count);
+            const auto first = std::lower_bound(slots.begin(), slots.end(), offset);
+            const auto limit = first + std::min<std::size_t>(
+                model->config.max_outputs_per_batch,
+                static_cast<std::size_t>(slots.end() - first));
+            if (limit != slots.end() && *limit < end) end = *limit;
+            const std::size_t count = end - offset;
+            llama_batch batch = llama_batch_init(static_cast<int>(count), 0, 1);
+            batch.n_tokens = static_cast<int>(count);
+            const std::size_t chunk_slot_begin = next_slot;
+            for (std::size_t local = 0; local < count; ++local) {
+                const std::size_t global = offset + local;
+                batch.token[local] = token_data[global];
+                batch.pos[local] = n_past + static_cast<llama_pos>(global);
+                batch.n_seq_id[local] = 1;
+                batch.seq_id[local][0] = 0;
+                batch.logits[local] = next_slot < slots.size() && slots[next_slot] == global;
+                if (batch.logits[local]) ++next_slot;
+            }
+            const int result = llama_decode(model->context, batch);
+            if (result != 0) {
+                llama_batch_free(batch);
+                throw std::runtime_error("multimodal prompt decode failed with code " +
+                                         std::to_string(result));
+            }
+            for (std::size_t slot = chunk_slot_begin; slot < next_slot; ++slot) {
+                const int local = static_cast<int>(slots[slot] - offset);
+                const float* logits = llama_get_logits_ith(model->context, local);
+                if (logits == nullptr) {
+                    llama_batch_free(batch);
+                    throw std::runtime_error("llama.cpp returned no multimodal answer-slot logits");
+                }
+                std::vector<double> raw;
+                evaluated.probabilities.push_back(selected_softmax(
+                    logits, model->labels, row.option_counts[slot],
+                    temperature_for(model->config, row.types[slot]),
+                    job->diagnostics ? &raw : nullptr));
+                if (job->diagnostics) evaluated.selected_logits.push_back(std::move(raw));
+            }
+            llama_batch_free(batch);
+            offset += count;
+        }
+        n_past += static_cast<llama_pos>(token_count);
+    }
+    if (!prompt_chunk_seen || evaluated.probabilities.size() != row.slots.size())
+        throw std::runtime_error("not all multimodal Decider answer slots produced logits");
+    return evaluated;
+}
+
+void run_job(ibrh_job* job, std::string request_text, ImageInput image,
              char* output, std::size_t output_capacity) noexcept {
     try {
         job->state = IBRH_JOB_RUNNING;
@@ -493,12 +688,16 @@ void run_job(ibrh_job* job, std::string request_text,
         std::vector<std::vector<double>> probabilities;
         probabilities.reserve(plan.rows.size());
         decider::native::Json diagnostic_rows = decider::native::Json::array();
+        std::size_t multimodal_input_tokens = 0;
         for (const auto& prepared : prepared_rows) {
             if (job->cancel.load()) {
                 job->state = IBRH_JOB_CANCELLED;
                 return;
             }
-            auto evaluated = evaluate_row(job, prepared);
+            auto evaluated = job->model->multimodal == nullptr
+                ? evaluate_row(job, prepared)
+                : evaluate_vision_row(job, prepared, image);
+            multimodal_input_tokens += evaluated.input_tokens;
             if (job->diagnostics) {
                 decider::native::Json item = decider::native::Json::object();
                 item["token_ids"] = prepared.tokens;
@@ -521,7 +720,8 @@ void run_job(ibrh_job* job, std::string request_text,
         for (const auto& row : prepared_rows) token_rows.push_back(row.tokens);
         auto response = decider::native::assemble_response(
             plan, probabilities, job->model->config.model_name,
-            unique_tokens(token_rows));
+            job->model->multimodal == nullptr
+                ? unique_tokens(token_rows) : multimodal_input_tokens);
         if (job->diagnostics) {
             decider::native::Json diagnostics = decider::native::Json::object();
             diagnostics["label_token_ids"] = job->model->labels;
@@ -560,7 +760,7 @@ ibrh_result IBRH_CALL query_capabilities(std::size_t size,
         IBRH_CAP_HOST_MEMORY;
     output->input_domain_mask = 1ULL << IBRH_RESOURCE_DOMAIN_HOST;
     output->output_domain_mask = 1ULL << IBRH_RESOURCE_DOMAIN_HOST;
-    output->maximum_inputs = 1;
+    output->maximum_inputs = 2;
     output->maximum_outputs = 1;
     output->maximum_in_flight_jobs = 1;
     output->harness_id = {kHarnessId, sizeof(kHarnessId) - 1};
@@ -577,6 +777,7 @@ ibrh_result IBRH_CALL runtime_create(std::size_t size,
     try {
         std::call_once(g_backend_once, [] {
             llama_log_set(capture_llama_log, nullptr);
+            mtmd_helper_log_set(capture_mtmd_log, nullptr);
             llama_backend_init();
         });
         auto runtime = std::make_unique<ibrh_runtime>();
@@ -628,6 +829,10 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
         auto model = std::make_unique<ibrh_model>();
         model->runtime = runtime;
         model->config = parse_model_config(checkpoint, parameters);
+        const auto package_path = model_root / "inferbridge-decider-export.json";
+        decider::native::Json package = decider::native::Json::object();
+        if (std::filesystem::is_regular_file(package_path))
+            package = read_json_file(package_path);
 
         llama_model_params model_parameters = llama_model_default_params();
         model_parameters.n_gpu_layers = runtime->backend == "VULKAN" ? -1 : 0;
@@ -654,9 +859,7 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
                 throw std::runtime_error(
                     "GGUF tokenizer does not provide 255 distinct Decider label tokens");
         }
-        const auto package_path = model_root / "inferbridge-decider-export.json";
-        if (std::filesystem::is_regular_file(package_path)) {
-            const auto package = read_json_file(package_path);
+        if (!package.empty()) {
             if (const auto found = package.find("label_token_ids"); found != package.end()) {
                 if (!found->is_array() ||
                     found->get<std::vector<llama_token>>() != model->labels) {
@@ -665,6 +868,33 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
                     throw std::runtime_error(
                         "GGUF label tokens do not match inferbridge-decider-export.json");
                 }
+            }
+        }
+        if (const auto vision = package.find("vision"); vision != package.end()) {
+            if (!vision->is_object() || !vision->contains("mmproj_file") ||
+                !(*vision)["mmproj_file"].is_string()) {
+                llama_model_free(model->model);
+                model->model = nullptr;
+                throw std::runtime_error("invalid vision metadata in InferBridge package");
+            }
+            const auto mmproj_path = model_root /
+                std::filesystem::u8path((*vision)["mmproj_file"].get<std::string>());
+            mtmd_context_params multimodal_parameters = mtmd_context_params_default();
+            multimodal_parameters.use_gpu = runtime->backend == "VULKAN";
+            multimodal_parameters.print_timings = false;
+            multimodal_parameters.n_threads = static_cast<int>(model->config.threads);
+            multimodal_parameters.warmup = false;
+            clear_llama_log();
+            model->multimodal = mtmd_init_from_file(
+                mmproj_path.u8string().c_str(), model->model, multimodal_parameters);
+            if (model->multimodal == nullptr || !mtmd_support_vision(model->multimodal)) {
+                if (model->multimodal != nullptr) mtmd_free(model->multimodal);
+                model->multimodal = nullptr;
+                llama_model_free(model->model);
+                model->model = nullptr;
+                const std::string detail = llama_log_tail();
+                throw std::runtime_error("llama.cpp failed to load Decider vision projector" +
+                    (detail.empty() ? std::string() : ":\n" + detail));
             }
         }
         llama_context_params context = llama_context_default_params();
@@ -679,6 +909,8 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
         context.no_perf = true;
         model->context = llama_init_from_model(model->model, context);
         if (model->context == nullptr) {
+            mtmd_free(model->multimodal);
+            model->multimodal = nullptr;
             llama_model_free(model->model);
             model->model = nullptr;
             throw std::runtime_error("llama.cpp failed to create Decider context");
@@ -694,6 +926,7 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
 void IBRH_CALL model_unload(ibrh_model* model) {
     if (model == nullptr) return;
     llama_free(model->context);
+    mtmd_free(model->multimodal);
     llama_model_free(model->model);
     delete model;
 }
@@ -705,7 +938,7 @@ ibrh_result IBRH_CALL model_describe_io(const ibrh_model* model, std::size_t siz
     *output = {};
     output->struct_size = sizeof(*output);
     output->api_version = IBRH_CURRENT_API_VERSION;
-    output->input_count = 1;
+    output->input_count = model->multimodal == nullptr ? 1 : 2;
     output->output_count = 1;
     return IBRH_OK;
 }
@@ -714,10 +947,15 @@ ibrh_result IBRH_CALL model_get_port(const ibrh_model* model,
                                      std::uint32_t direction, std::uint32_t index,
                                      std::size_t size,
                                      ibrh_port_descriptor* output) {
-    if (model == nullptr || output == nullptr || index != 0 ||
+    if (model == nullptr || output == nullptr ||
         (direction != IBRH_PORT_INPUT && direction != IBRH_PORT_OUTPUT))
         return IBRH_ERROR_INVALID_ARGUMENT;
     if (size < sizeof(*output)) return IBRH_ERROR_STRUCT_TOO_SMALL;
+    if (direction == IBRH_PORT_INPUT && index == 1 && model->multimodal != nullptr) {
+        fill_image_port(output);
+        return IBRH_OK;
+    }
+    if (index != 0) return IBRH_ERROR_INVALID_ARGUMENT;
     fill_text_port(direction, direction == IBRH_PORT_OUTPUT
         ? static_cast<std::uint32_t>(model->config.max_output_bytes) : 0, output);
     return IBRH_OK;
@@ -728,7 +966,8 @@ ibrh_result IBRH_CALL model_plan_outputs(const ibrh_model* model, std::size_t si
                                          std::uint32_t capacity,
                                          ibrh_port_descriptor* outputs) {
     if (model == nullptr || !valid_struct(size, request) ||
-        request->input_count != 1 || request->inputs == nullptr ||
+        request->input_count != (model->multimodal == nullptr ? 1U : 2U) ||
+        request->inputs == nullptr ||
         capacity < 1 || outputs == nullptr)
         return IBRH_ERROR_INVALID_ARGUMENT;
     fill_text_port(IBRH_PORT_OUTPUT,
@@ -740,7 +979,8 @@ ibrh_result IBRH_CALL submit(ibrh_model* model, std::size_t size,
                              const ibrh_submit_request* request,
                              ibrh_job** output) {
     if (model == nullptr || !valid_struct(size, request) || output == nullptr ||
-        request->input_count != 1 || request->output_count != 1 ||
+        request->input_count != (model->multimodal == nullptr ? 1U : 2U) ||
+        request->output_count != 1 ||
         request->inputs == nullptr || request->outputs == nullptr)
         return IBRH_ERROR_INVALID_ARGUMENT;
     *output = nullptr;
@@ -749,6 +989,28 @@ ibrh_result IBRH_CALL submit(ibrh_model* model, std::size_t size,
         return IBRH_ERROR_INVALID_STATE;
     try {
         validate_host_json_binding(request->inputs[0], IBRH_RESOURCE_ACCESS_READ);
+        ImageInput image;
+        if (model->multimodal != nullptr) {
+            validate_host_image_binding(request->inputs[1]);
+            const auto& source = request->inputs[1].resource;
+            image.width = source.width;
+            image.height = source.height;
+            image.rgb.resize(static_cast<std::size_t>(source.width) * source.height * 3U);
+            const auto* source_data = reinterpret_cast<const unsigned char*>(
+                static_cast<std::uintptr_t>(source.native_handle + source.byte_offset));
+            for (std::uint32_t y = 0; y < source.height; ++y) {
+                const auto* row = source_data + static_cast<std::size_t>(y) * source.row_stride_bytes;
+                for (std::uint32_t x = 0; x < source.width; ++x) {
+                    const std::size_t source_offset = static_cast<std::size_t>(x) * 4U;
+                    const std::size_t target_offset =
+                        (static_cast<std::size_t>(y) * source.width + x) * 3U;
+                    const bool bgra = source.pixel_format == IBRH_PIXEL_BGRA8;
+                    image.rgb[target_offset] = row[source_offset + (bgra ? 2U : 0U)];
+                    image.rgb[target_offset + 1U] = row[source_offset + 1U];
+                    image.rgb[target_offset + 2U] = row[source_offset + (bgra ? 0U : 2U)];
+                }
+            }
+        }
         validate_host_json_binding(request->outputs[0], IBRH_RESOURCE_ACCESS_WRITE);
         const auto& input = request->inputs[0].resource;
         const auto& destination = request->outputs[0].resource;
@@ -768,7 +1030,7 @@ ibrh_result IBRH_CALL submit(ibrh_model* model, std::size_t size,
         }
         std::string request_text(input_data, static_cast<std::size_t>(input.byte_size));
         while (!request_text.empty() && request_text.back() == '\0') request_text.pop_back();
-        job->worker = std::thread(run_job, job.get(), std::move(request_text),
+        job->worker = std::thread(run_job, job.get(), std::move(request_text), std::move(image),
             output_data, static_cast<std::size_t>(destination.byte_size));
         *output = job.release();
         return IBRH_OK;

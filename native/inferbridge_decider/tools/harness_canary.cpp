@@ -5,10 +5,14 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 namespace {
 
@@ -57,6 +61,25 @@ ibrh_resource host_json(void* data, std::size_t size, std::uint32_t access) {
     return resource;
 }
 
+ibrh_resource host_rgba(void* data, std::uint32_t width, std::uint32_t height) {
+    ibrh_resource resource{};
+    resource.struct_size = sizeof(resource);
+    resource.api_version = IBRH_CURRENT_API_VERSION;
+    resource.domain = IBRH_RESOURCE_DOMAIN_HOST;
+    resource.kind = IBRH_RESOURCE_KIND_IMAGE_2D;
+    resource.access = IBRH_RESOURCE_ACCESS_READ;
+    resource.pixel_format = IBRH_PIXEL_RGBA8;
+    resource.width = width;
+    resource.height = height;
+    resource.depth = 1;
+    resource.row_stride_bytes = width * 4U;
+    resource.native_handle_type = IBRH_NATIVE_HANDLE_HOST_POINTER;
+    resource.byte_size = static_cast<std::uint64_t>(resource.row_stride_bytes) * height;
+    resource.native_handle = static_cast<std::uint64_t>(
+        reinterpret_cast<std::uintptr_t>(data));
+    return resource;
+}
+
 ibrh_transfer_binding binding(ibrh_resource resource) {
     ibrh_transfer_binding result{};
     result.struct_size = sizeof(result);
@@ -72,7 +95,7 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics] [--timing] [--output FILE]\n";
+        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--image FILE] [--diagnostics] [--timing] [--output FILE]\n";
         return 2;
     }
     try {
@@ -82,6 +105,7 @@ int main(int argc, char** argv) {
         bool diagnostics = false;
         bool timing = false;
         std::string output_path;
+        std::string image_path;
         for (int index = 3; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--diagnostics") {
@@ -90,6 +114,8 @@ int main(int argc, char** argv) {
                 timing = true;
             } else if (argument == "--output" && index + 1 < argc) {
                 output_path = argv[++index];
+            } else if (argument == "--image" && index + 1 < argc) {
+                image_path = argv[++index];
             } else if (argument == "CPU" || argument == "VULKAN") {
                 backend = argument;
             } else {
@@ -122,26 +148,52 @@ int main(int argc, char** argv) {
                   runtime, "model_load");
             const auto load_finished = std::chrono::steady_clock::now();
 
-            ibrh_resource input_resource =
-                host_json(request_json.data(), request_json.size(), IBRH_RESOURCE_ACCESS_READ);
+            ibrh_model_io_descriptor io{};
+            check(api, api.model_describe_io(model, sizeof(io), &io), model,
+                  "model_describe_io");
+            if (io.input_count == 2 && image_path.empty())
+                throw std::runtime_error("this model requires --image FILE");
+            if (io.input_count == 1 && !image_path.empty())
+                throw std::runtime_error("this model does not expose an image input");
+
+            int image_width = 0;
+            int image_height = 0;
+            int image_channels = 0;
+            std::unique_ptr<unsigned char, decltype(&stbi_image_free)> image(
+                nullptr, stbi_image_free);
+            if (io.input_count == 2) {
+                image.reset(stbi_load(image_path.c_str(), &image_width, &image_height,
+                                      &image_channels, 4));
+                if (!image)
+                    throw std::runtime_error("cannot decode image: " + image_path);
+            }
+
+            std::vector<ibrh_resource> input_resources;
+            input_resources.push_back(
+                host_json(request_json.data(), request_json.size(), IBRH_RESOURCE_ACCESS_READ));
+            if (io.input_count == 2)
+                input_resources.push_back(host_rgba(image.get(),
+                    static_cast<std::uint32_t>(image_width),
+                    static_cast<std::uint32_t>(image_height)));
             ibrh_output_plan_request plan{};
             plan.struct_size = sizeof(plan);
             plan.api_version = IBRH_CURRENT_API_VERSION;
-            plan.inputs = &input_resource;
-            plan.input_count = 1;
+            plan.inputs = input_resources.data();
+            plan.input_count = static_cast<std::uint32_t>(input_resources.size());
             ibrh_port_descriptor output_port{};
             check(api, api.model_plan_outputs(model, sizeof(plan), &plan, 1, &output_port),
                   model, "model_plan_outputs");
 
             std::vector<char> output(output_port.width, '\0');
-            auto input = binding(input_resource);
+            std::vector<ibrh_transfer_binding> inputs;
+            for (const auto& resource : input_resources) inputs.push_back(binding(resource));
             auto output_binding = binding(
                 host_json(output.data(), output.size(), IBRH_RESOURCE_ACCESS_WRITE));
             ibrh_submit_request submit{};
             submit.struct_size = sizeof(submit);
             submit.api_version = IBRH_CURRENT_API_VERSION;
-            submit.inputs = &input;
-            submit.input_count = 1;
+            submit.inputs = inputs.data();
+            submit.input_count = static_cast<std::uint32_t>(inputs.size());
             submit.outputs = &output_binding;
             submit.output_count = 1;
             submit.source_frame_id = 1;

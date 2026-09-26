@@ -2,7 +2,8 @@
 
 This directory contains the native InferBridge 2 harness for Decider. The
 shipping interface is one UTF-8 JSON input and one UTF-8 JSON output using the
-same request and response shapes as `POST /v1/systemone`.
+same request and response shapes as `POST /v1/systemone`. A packaged vision
+checkpoint additionally exposes a host RGBA8/BGRA8 image input.
 
 The implementation is deliberately Decider-owned. It uses the standalone
 Qwen GGUF harness as an ABI/lifecycle reference, while keeping Decider prompt
@@ -23,6 +24,8 @@ this repository.
 - Model-backed plain/state-first inference for independent and packed rows with
   2..255 options, including exact wide-label token insertion and per-slot
   answer-type temperatures from `decider_config.json`.
+- Qwen3.5-VL image-plus-text decisions through llama.cpp `mtmd`, with the
+  language GGUF and vision projector loaded as one InferBridge model.
 
 Chat metadata and verified shared-prefix state copying are explicit follow-up
 gates; the harness rejects an unsupported model configuration or request
@@ -88,6 +91,18 @@ python -m venv .venv-gguf
   C:\models\decider-2b C:\models\decider-2b-native\decider-2b-bf16.gguf
 ```
 
+For a multimodal checkpoint, export the projector at the same time. The
+projector path is recorded in `inferbridge-decider-export.json`; the native
+loader uses its presence to switch from one input port to two.
+
+```powershell
+.venv-gguf\Scripts\python native/inferbridge_decider/tools/export_gguf.py `
+  C:\models\decider-2b-vision `
+  C:\models\decider-2b-vision-native\model-decider-2b-vision-bf16.gguf `
+  --mmproj-output `
+  C:\models\decider-2b-vision-native\mmproj-decider-2b-vision-bf16.gguf
+```
+
 Use BF16 for the initial Python/native logit comparison. Quantization changes
 the probability distribution and must pass its own evaluation and temperature
 calibration before being published as an interchangeable Decider build.
@@ -107,6 +122,31 @@ output is intended for Python/native parity fixtures and is disabled for normal
 InferBridge submissions.
 Use `--output out\parity\native.json` to write the canary response directly to
 a comparison fixture.
+
+For a packaged vision model, pass a PNG, JPEG, BMP, or other stb-supported
+image to the canary. The canary decodes it to RGBA8 and submits the JSON and
+image as separate InferBridge bindings:
+
+```powershell
+out\decider-native-vulkan\Release\decider_native_canary.exe `
+  C:\models\decider-2b-vision-native\model-decider-2b-vision-bf16.gguf `
+  native\inferbridge_decider\examples\simple_vision_choice.json `
+  VULKAN --image media\cover.png --timing
+```
+
+The first native vision milestone accepts host images; the language model and
+vision encoder both execute on Vulkan when the runtime backend is `VULKAN`.
+Direct `IBRH_NATIVE_HANDLE_VULKAN_IMAGE` ingestion is not advertised yet, so
+InferBridge stages a GPU-origin image into host RGBA/BGRA for this version.
+
+The released `Mapika/decider-2b-vision` checkpoint at Hub revision
+`863e290863655f1d6b69324d77d09ac972d21609` was converted to a 3.76 GB BF16
+language GGUF plus a 671 MB BF16 Qwen3-VL projector. On the RX 9070, the
+`media/cover.png` probe selected `food` with probability `0.9996`; its large
+2000-by-840 input expanded to 1,638 vision tokens and completed in 0.97 s after
+the Vulkan shader cache was populated.
+Image dimensions therefore materially affect latency and should be bounded or
+resized by the caller for real-time use.
 
 Generate the matching Python-side fixture from the original checkpoint with:
 

@@ -43,7 +43,9 @@ if(DECIDER_BUILD_HARNESS)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
     set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
 
     add_subdirectory("${LLAMA_CPP_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
 
@@ -53,11 +55,12 @@ if(DECIDER_BUILD_HARNESS)
         "${INFERBRIDGE_ROOT}/include"
         "${LLAMA_CPP_ROOT}/include"
         "${LLAMA_CPP_ROOT}/ggml/include"
+        "${LLAMA_CPP_ROOT}/tools/mtmd"
         "${LLAMA_CPP_ROOT}/vendor")
     target_compile_definitions(inferbridge_decider_harness PRIVATE
         INFERBRIDGE_HARNESS_BUILDING_LIBRARY=1)
     target_link_libraries(inferbridge_decider_harness PRIVATE
-        decider_native_protocol llama)
+        decider_native_protocol llama mtmd)
     set_target_properties(inferbridge_decider_harness PROPERTIES
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES
@@ -66,7 +69,9 @@ if(DECIDER_BUILD_HARNESS)
     if(DECIDER_BUILD_CANARY)
         add_executable(decider_native_canary tools/harness_canary.cpp)
         target_compile_features(decider_native_canary PRIVATE cxx_std_17)
-        target_include_directories(decider_native_canary PRIVATE "${INFERBRIDGE_ROOT}/include")
+        target_include_directories(decider_native_canary PRIVATE
+            "${INFERBRIDGE_ROOT}/include"
+            "${LLAMA_CPP_ROOT}/vendor")
         target_link_libraries(decider_native_canary PRIVATE inferbridge_decider_harness)
     endif()
 endif()

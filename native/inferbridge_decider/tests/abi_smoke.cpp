@@ -27,8 +27,8 @@ int main() {
         ibrh_capabilities capabilities{};
         require(api.query_capabilities(sizeof(capabilities), &capabilities) == IBRH_OK,
                 "query_capabilities failed");
-        require(capabilities.maximum_inputs == 1 && capabilities.maximum_outputs == 1,
-                "Decider must expose one JSON input and output");
+        require(capabilities.maximum_inputs == 2 && capabilities.maximum_outputs == 1,
+                "Decider must support JSON plus an optional image input");
         require((capabilities.flags & IBRH_CAP_HOST_MEMORY) != 0,
                 "Decider must support host-memory JSON");
 

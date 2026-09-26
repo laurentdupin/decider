@@ -1,0 +1,15 @@
+{
+  "state": "Use the supplied image as the source of visual evidence.",
+  "questions": {
+    "plate_contents": {
+      "type": "choice",
+      "instructions": "What is visibly shown on the plate in the image?",
+      "criteria": {
+        "food": "A meal with several food items",
+        "tools": "Hand tools and hardware",
+        "clothing": "Folded clothes"
+      }
+    }
+  },
+  "independent": true
+}
