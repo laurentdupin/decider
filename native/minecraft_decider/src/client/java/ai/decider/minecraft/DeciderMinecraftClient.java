@@ -266,10 +266,13 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             parameters.addProperty("batch_size", configuration.batchSize());
             parameters.addProperty("threads", configuration.threads());
             parameters.addProperty("disable_vision", true);
+            Path parametersPath = FabricLoader.getInstance().getConfigDir()
+                .resolve("decider-minecraft-model-parameters.json");
+            Files.writeString(parametersPath, GSON.toJson(parameters), StandardCharsets.UTF_8);
             ProcessBuilder builder = new ProcessBuilder(
                 configuration.executable(), configuration.model(),
-                configuration.backend(), "--model-parameters",
-                GSON.toJson(parameters), "--ready");
+                configuration.backend(), "--model-parameters-file",
+                parametersPath.toString(), "--ready");
             builder.environment().put("GGML_VK_VISIBLE_DEVICES", configuration.gpu());
             builder.directory(FabricLoader.getInstance().getGameDir().toFile());
             builder.redirectErrorStream(true);

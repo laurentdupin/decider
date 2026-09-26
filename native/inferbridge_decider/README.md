@@ -126,6 +126,8 @@ a comparison fixture.
 Use `--model-parameters` to pass the JSON object supplied to InferBridge's
 `model_load`. This is useful for memory-bound quantized models; for example,
 `--model-parameters '{"context_size":4096,"batch_size":256,"threads":8}'`.
+Use `--model-parameters-file parameters.json` when the calling environment
+cannot preserve JSON quoting in command-line arguments.
 
 For a packaged vision model, pass a PNG, JPEG, BMP, or other stb-supported
 image to the canary. The canary decodes it to RGBA8 and submits the JSON and

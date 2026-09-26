@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -61,12 +63,23 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
     return result;
 }
 
+std::string read_text_file(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("could not open model parameters file: " + path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (!input.good() && !input.eof())
+        throw std::runtime_error("could not read model parameters file: " + path);
+    return contents.str();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: decider_native_jsonl MODEL.gguf [CPU|VULKAN] "
-                     "[--model-parameters JSON] [--ready] [--timing]\n";
+                     "[--model-parameters JSON | --model-parameters-file FILE] "
+                     "[--ready] [--timing]\n";
         return 2;
     }
     try {
@@ -83,6 +96,8 @@ int main(int argc, char** argv) {
                 ready = true;
             } else if (argument == "--model-parameters" && index + 1 < argc) {
                 model_parameters = argv[++index];
+            } else if (argument == "--model-parameters-file" && index + 1 < argc) {
+                model_parameters = read_text_file(argv[++index]);
             } else if (argument == "CPU" || argument == "VULKAN") {
                 backend = argument;
             } else {
