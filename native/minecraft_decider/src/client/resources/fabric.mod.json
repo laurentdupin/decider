@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "decider-minecraft",
+  "version": "${version}",
+  "name": "Decider Minecraft",
+  "description": "Local InferBridge Decider tactical controller for Minecraft Java Edition.",
+  "authors": ["Decider contributors"],
+  "license": "Apache-2.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "ai.decider.minecraft.DeciderMinecraftClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
