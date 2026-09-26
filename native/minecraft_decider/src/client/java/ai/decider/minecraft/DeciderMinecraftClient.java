@@ -70,6 +70,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private BlockPos taskOrigin;
     private String houseMaterial = "minecraft:oak_planks";
     private BlockPos furnacePosition;
+    private int chickenQuantity = 1;
     private boolean awaitingVerification;
     private int verificationTicks;
     private IntegratedServer taskServer;
@@ -166,6 +167,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         taskOrigin = null;
         furnacePosition = null;
         houseMaterial = "minecraft:oak_planks";
+        chickenQuantity = 1;
         awaitingVerification = false;
         verificationTicks = 0;
         taskServer = null;
@@ -296,16 +298,16 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
                 criteria.addProperty("stop", "Wait without placing the furnace");
             }
             case LOAD_CHICKEN -> {
-                criteria.addProperty("load_raw_chicken", "Put one raw chicken into the furnace input slot");
-                criteria.addProperty("stop", "Wait without loading food");
+                criteria.addProperty("cook_one_chicken", "Cook one chicken quickly for an immediate meal");
+                criteria.addProperty("cook_four_chickens", "Cook four chickens as a larger food supply");
             }
             case LOAD_FUEL -> {
-                criteria.addProperty("load_coal", "Put coal into the furnace fuel slot to begin cooking");
-                criteria.addProperty("stop", "Wait without adding fuel");
+                criteria.addProperty("fuel_with_coal", "Use efficient coal to start cooking now");
+                criteria.addProperty("fuel_with_charcoal", "Use renewable charcoal to start cooking now");
             }
             case COLLECT_CHICKEN -> {
-                criteria.addProperty("collect_cooked_chicken", "Move the cooked chicken into the player's hotbar");
-                criteria.addProperty("stop", "Leave the cooked food in the furnace");
+                criteria.addProperty("collect_now", "Collect the cooked chicken into inventory now");
+                criteria.addProperty("collect_and_finish", "Collect the cooked chicken and finish the task");
             }
             default -> criteria.addProperty("stop", "No further action is required");
         }
@@ -365,17 +367,22 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
                 beginVerification();
             }
             case LOAD_CHICKEN -> {
-                if (!action.equals("load_raw_chicken")) return;
-                setFurnaceItem(0, new ItemStack(Items.CHICKEN));
+                if (action.equals("cook_one_chicken")) chickenQuantity = 1;
+                else if (action.equals("cook_four_chickens")) chickenQuantity = 4;
+                else return;
+                setFurnaceItem(0, new ItemStack(Items.CHICKEN, chickenQuantity));
                 beginVerification();
             }
             case LOAD_FUEL -> {
-                if (!action.equals("load_coal")) return;
-                setFurnaceItem(1, new ItemStack(Items.COAL));
+                if (action.equals("fuel_with_coal"))
+                    setFurnaceItem(1, new ItemStack(Items.COAL));
+                else if (action.equals("fuel_with_charcoal"))
+                    setFurnaceItem(1, new ItemStack(Items.CHARCOAL));
+                else return;
                 beginVerification();
             }
             case COLLECT_CHICKEN -> {
-                if (!action.equals("collect_cooked_chicken")) return;
+                if (!action.equals("collect_now") && !action.equals("collect_and_finish")) return;
                 transferCookedChicken();
                 beginVerification();
             }
@@ -493,7 +500,8 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
                     AbstractFurnaceBlockEntity furnace) {
                     furnaceSnapshot.set(new FurnaceSnapshot(
                         count(furnace.getItem(0), Items.CHICKEN),
-                        count(furnace.getItem(1), Items.COAL),
+                        count(furnace.getItem(1), Items.COAL) +
+                            count(furnace.getItem(1), Items.CHARCOAL),
                         count(furnace.getItem(2), Items.COOKED_CHICKEN),
                         level.getBlockState(position).getValue(BlockStateProperties.LIT)));
                 }
