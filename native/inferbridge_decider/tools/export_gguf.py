@@ -36,6 +36,11 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("output", type=Path, help="Output .gguf path")
     parser.add_argument(
+        "--mmproj-output",
+        type=Path,
+        help="Also export a multimodal projector GGUF to this exact path.",
+    )
+    parser.add_argument(
         "--outtype",
         choices=("auto", "bf16", "f16", "f32", "q8_0"),
         default="bf16",
@@ -51,11 +56,16 @@ def main() -> int:
 
     checkpoint = args.checkpoint.resolve()
     output = args.output.resolve()
+    mmproj_output = args.mmproj_output.resolve() if args.mmproj_output else None
     config_path = checkpoint / "decider_config.json"
     if not checkpoint.is_dir() or not config_path.is_file():
         parser.error("checkpoint must be a local directory containing decider_config.json")
     if output.suffix.lower() != ".gguf":
         parser.error("output must have a .gguf extension")
+    if mmproj_output is not None and mmproj_output.suffix.lower() != ".gguf":
+        parser.error("--mmproj-output must have a .gguf extension")
+    if mmproj_output == output:
+        parser.error("--mmproj-output must differ from the language model output")
     if not (LLAMA / "convert_hf_to_gguf.py").is_file():
         parser.error("third_party/llama.cpp is not initialized")
 
@@ -67,6 +77,8 @@ def main() -> int:
         parser.error("decider_config.json contradicts layout='plain' with chat_template=true")
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    if mmproj_output is not None:
+        mmproj_output.parent.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
         str(LLAMA / "convert_hf_to_gguf.py"),
@@ -82,8 +94,24 @@ def main() -> int:
     if args.skip_conversion:
         if not output.is_file():
             parser.error("--skip-conversion requires an existing output GGUF")
+        if mmproj_output is not None and not mmproj_output.is_file():
+            parser.error("--skip-conversion requires an existing projector GGUF")
     else:
         subprocess.run(command, cwd=LLAMA, check=True)
+        if mmproj_output is not None:
+            mmproj_command = [
+                sys.executable,
+                str(LLAMA / "convert_hf_to_gguf.py"),
+                str(checkpoint),
+                "--outfile",
+                str(mmproj_output),
+                "--outtype",
+                args.outtype,
+                "--mmproj",
+            ]
+            if args.use_temp_file:
+                mmproj_command.append("--use-temp-file")
+            subprocess.run(mmproj_command, cwd=LLAMA, check=True)
 
     from transformers import AutoTokenizer
     from decider.prompt import chat_template, label_table
@@ -109,6 +137,18 @@ def main() -> int:
             ["git", "-C", str(LLAMA), "rev-parse", "HEAD"], text=True
         ).strip(),
     }
+    if mmproj_output is not None:
+        model_config_path = checkpoint / "config.json"
+        processor_config_path = checkpoint / "processor_config.json"
+        provenance["vision"] = {
+            "mmproj_file": mmproj_output.name,
+            "pixel_formats": ["rgba8", "bgra8"],
+            "source_model_config_sha256": sha256(model_config_path),
+        }
+        if processor_config_path.is_file():
+            provenance["vision"]["source_processor_config_sha256"] = sha256(
+                processor_config_path
+            )
     if layout == "chat":
         chat = chat_template(tokenizer)
         provenance["chat"] = {
@@ -122,6 +162,8 @@ def main() -> int:
         json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
     )
     print(f"Exported {output}")
+    if mmproj_output is not None:
+        print(f"Exported {mmproj_output}")
     print(f"Packaged {packaged_config}")
     return 0
 
