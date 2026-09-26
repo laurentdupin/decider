@@ -1,0 +1,25 @@
+{
+  "state": {
+    "ticket": "Customer reports being charged twice for the same order."
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this ticket?",
+      "criteria": {
+        "billing": "Payment, invoice, or duplicate-charge issues",
+        "support": "Product usage or technical issues"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this ticket?",
+      "criteria": [
+        "low",
+        "medium",
+        "high"
+      ]
+    }
+  },
+  "independent": true
+}

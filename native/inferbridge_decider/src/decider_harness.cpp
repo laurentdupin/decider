@@ -1,6 +1,7 @@
 #include "decider_protocol.h"
 
 #include <inferbridge/inferbridge_harness.h>
+#include <ggml-backend.h>
 #include <llama.h>
 
 #include <algorithm>
@@ -57,8 +58,24 @@ void quiet_llama_log(ggml_log_level, const char*, void*) {}
 
 decider::native::Json read_json_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) return decider::native::Json::object();
+    if (!input)
+        throw std::invalid_argument("decider_config.json was not found beside the GGUF model");
     return decider::native::Json::parse(input, nullptr, true, true);
+}
+
+bool has_vulkan_gpu() {
+    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(device);
+        std::string name = registry == nullptr ? std::string() : ggml_backend_reg_name(registry);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            name.find("vulkan") != std::string::npos)
+            return true;
+    }
+    return false;
 }
 
 struct ModelConfig {
@@ -378,6 +395,8 @@ ibrh_result IBRH_CALL runtime_create(std::size_t size,
         if (runtime->backend.empty()) runtime->backend = "CPU";
         if (runtime->backend != "CPU" && runtime->backend != "VULKAN")
             throw std::invalid_argument("Decider harness supports CPU or VULKAN backends");
+        if (runtime->backend == "VULKAN" && !has_vulkan_gpu())
+            throw std::invalid_argument("no llama.cpp Vulkan GPU device is registered");
         *output = runtime.release();
         return IBRH_OK;
     } catch (const std::exception& exception) {

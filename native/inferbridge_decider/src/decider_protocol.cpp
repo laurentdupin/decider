@@ -130,7 +130,9 @@ double score_confidence(const std::vector<double>& probabilities) {
 
 double rounded(double value, int digits) {
     const double scale = std::pow(10.0, digits);
-    return std::round(value * scale) / scale;
+    // Python's round(), used by SystemOne, resolves exact halfway cases to the
+    // nearest even integer under the default IEEE-754 rounding mode.
+    return std::nearbyint(value * scale) / scale;
 }
 
 Json format_answer(const Question& question, std::vector<double> probabilities) {

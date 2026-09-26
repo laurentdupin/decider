@@ -4,6 +4,7 @@ project(InferBridgeDecider VERSION 0.1.0 LANGUAGES C CXX)
 
 option(DECIDER_BUILD_HARNESS "Build the InferBridge llama.cpp harness" ON)
 option(DECIDER_BUILD_TESTS "Build native Decider protocol tests" ON)
+option(DECIDER_BUILD_CANARY "Build the model-backed InferBridge canary" ON)
 option(DECIDER_LLAMA_VULKAN "Build llama.cpp with Vulkan support" OFF)
 
 set(INFERBRIDGE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../third_party/Inferbridge"
@@ -61,6 +62,13 @@ if(DECIDER_BUILD_HARNESS)
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES
         OUTPUT_NAME inferbridge_decider_harness)
+
+    if(DECIDER_BUILD_CANARY)
+        add_executable(decider_native_canary tools/harness_canary.cpp)
+        target_compile_features(decider_native_canary PRIVATE cxx_std_17)
+        target_include_directories(decider_native_canary PRIVATE "${INFERBRIDGE_ROOT}/include")
+        target_link_libraries(decider_native_canary PRIVATE inferbridge_decider_harness)
+    endif()
 endif()
 
 if(DECIDER_BUILD_TESTS)
