@@ -20,12 +20,13 @@ this repository.
   models and returning logits at requested prompt positions.
 - An InferBridge ABI 2 harness with CPU/Vulkan runtime selection, GGUF model
   loading, asynchronous submission, cancellation, and bounded JSON output.
-- Model-backed plain/state-first inference for independent rows with 2..10
-  options, including per-answer-type temperatures from `decider_config.json`.
+- Model-backed plain/state-first inference for independent and packed rows with
+  2..255 options, including exact wide-label token insertion and per-slot
+  answer-type temperatures from `decider_config.json`.
 
-Chat metadata, wide labels, packed requests, and verified shared-prefix state
-copying are explicit follow-up gates; the harness rejects an unsupported model
-configuration or request rather than silently using a different prompt.
+Chat metadata and verified shared-prefix state copying are explicit follow-up
+gates; the harness rejects an unsupported model configuration or request
+rather than silently using a different prompt.
 
 ## Configure and test the protocol layer
 
@@ -76,6 +77,29 @@ JSON response writer with the canary executable:
 out\decider-native\Release\decider_native_canary.exe `
   C:\models\decider-2b-native\decider-2b-bf16.gguf `
   native\inferbridge_decider\examples\request.json CPU
+```
+
+Append `--diagnostics` to include exact prompt token IDs, answer-slot positions,
+the 255 label token IDs, and raw selected logits in the canary response. This
+output is intended for Python/native parity fixtures and is disabled for normal
+InferBridge submissions.
+
+Generate the matching Python-side fixture from the original checkpoint with:
+
+```powershell
+python native\inferbridge_decider\tools\generate_parity_fixture.py `
+  C:\models\decider-2b native\inferbridge_decider\examples\request.json `
+  out\parity\python.json --device cuda --dtype bf16
+```
+
+Compare each row's `token_ids`, `slots`, and `selected_logits` with the native
+diagnostic response before comparing the calibrated probabilities and final
+response. Token and slot arrays must match exactly; logits and probabilities
+use measured tolerances because the PyTorch and llama.cpp kernels differ.
+
+```powershell
+python native\inferbridge_decider\tools\compare_parity.py `
+  out\parity\python.json out\parity\native.json
 ```
 
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use

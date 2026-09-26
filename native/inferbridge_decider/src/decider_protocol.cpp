@@ -1,6 +1,8 @@
 #include "decider_protocol.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -52,6 +54,48 @@ std::string text(const Json& value) {
     return value.is_string() ? value.get<std::string>() : python_json(value);
 }
 
+std::string python_repr(const Json& value) {
+    if (value.is_null()) return "None";
+    if (value.is_boolean()) return value.get<bool>() ? "True" : "False";
+    if (value.is_string()) {
+        std::string output = "'";
+        for (const unsigned char character : value.get_ref<const std::string&>()) {
+            switch (character) {
+                case '\\': output += "\\\\"; break;
+                case '\'': output += "\\'"; break;
+                case '\n': output += "\\n"; break;
+                case '\r': output += "\\r"; break;
+                case '\t': output += "\\t"; break;
+                default: output.push_back(static_cast<char>(character)); break;
+            }
+        }
+        return output + "'";
+    }
+    if (value.is_array()) {
+        std::string output = "[";
+        for (std::size_t index = 0; index < value.size(); ++index) {
+            if (index != 0) output += ", ";
+            output += python_repr(value[index]);
+        }
+        return output + "]";
+    }
+    if (value.is_object()) {
+        std::string output = "{";
+        bool first = true;
+        for (const auto& item : value.items()) {
+            if (!first) output += ", ";
+            first = false;
+            output += python_repr(Json(item.key())) + ": " + python_repr(item.value());
+        }
+        return output + "}";
+    }
+    return scalar_json(value);
+}
+
+std::string python_str(const Json& value) {
+    return value.is_string() ? value.get<std::string>() : python_repr(value);
+}
+
 bool missing_description(const Json& value) {
     return value.is_null() || (value.is_string() && value.get_ref<const std::string&>().empty());
 }
@@ -95,6 +139,18 @@ std::vector<double> normalized(std::vector<double> probabilities) {
     return probabilities;
 }
 
+std::vector<double> format_normalized(std::vector<double> probabilities) {
+    if (probabilities.empty()) throw std::invalid_argument("an answer has no probabilities");
+    for (const double value : probabilities) {
+        if (!std::isfinite(value) || value < 0.0)
+            throw std::invalid_argument("answer probabilities must be finite and non-negative");
+    }
+    const double total = std::accumulate(probabilities.begin(), probabilities.end(), 0.0);
+    if (total != 0.0)
+        for (double& value : probabilities) value /= total;
+    return probabilities;
+}
+
 double certainty(const std::vector<double>& probabilities) {
     double entropy = 0.0;
     for (const double value : probabilities)
@@ -105,41 +161,46 @@ double certainty(const std::vector<double>& probabilities) {
 }
 
 double choice_confidence(const std::vector<double>& probabilities) {
-    const double n = static_cast<double>(probabilities.size());
-    return probabilities.size() <= 1
+    const auto values = normalized(probabilities);
+    const double n = static_cast<double>(values.size());
+    return values.size() <= 1
         ? 1.0
-        : clip01((n * *std::max_element(probabilities.begin(), probabilities.end()) - 1.0) /
+        : clip01((n * *std::max_element(values.begin(), values.end()) - 1.0) /
                  (n - 1.0));
 }
 
 double score_confidence(const std::vector<double>& probabilities) {
-    if (probabilities.size() <= 1) return 1.0;
+    const auto values = normalized(probabilities);
+    if (values.size() <= 1) return 1.0;
     const std::size_t peak = static_cast<std::size_t>(
-        std::distance(probabilities.begin(),
-                      std::max_element(probabilities.begin(), probabilities.end())));
+        std::distance(values.begin(),
+                      std::max_element(values.begin(), values.end())));
     double spread = 0.0;
     double uniform = 0.0;
-    const double middle = (static_cast<double>(probabilities.size()) - 1.0) / 2.0;
-    for (std::size_t index = 0; index < probabilities.size(); ++index) {
-        spread += probabilities[index] * std::abs(static_cast<double>(index) - peak);
+    const double middle = (static_cast<double>(values.size()) - 1.0) / 2.0;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        spread += values[index] * std::abs(static_cast<double>(index) - peak);
         uniform += std::abs(static_cast<double>(index) - middle);
     }
-    uniform /= static_cast<double>(probabilities.size());
+    uniform /= static_cast<double>(values.size());
     return clip01(1.0 - spread / uniform);
 }
 
 double rounded(double value, int digits) {
-    const double scale = std::pow(10.0, digits);
-    // Python's round(), used by SystemOne, resolves exact halfway cases to the
-    // nearest even integer under the default IEEE-754 rounding mode.
-    return std::nearbyint(value * scale) / scale;
+    std::array<char, 128> buffer{};
+    const auto converted = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value,
+        std::chars_format::fixed, digits);
+    if (converted.ec != std::errc())
+        throw std::runtime_error("could not round Decider answer");
+    return std::stod(std::string(buffer.data(), converted.ptr));
 }
 
 Json format_answer(const Question& question, std::vector<double> probabilities) {
     if (probabilities.size() < question.options.size())
         throw std::invalid_argument("an answer has fewer probabilities than options");
     probabilities.resize(question.options.size());
-    probabilities = normalized(std::move(probabilities));
+    probabilities = format_normalized(std::move(probabilities));
     const std::size_t peak = static_cast<std::size_t>(
         std::distance(probabilities.begin(),
                       std::max_element(probabilities.begin(), probabilities.end())));
@@ -181,6 +242,7 @@ Question parse_question(const std::string& id, const Json& specification) {
     const std::string type = specification.value("type", "choice");
     const Json* criteria = optional_member(specification, "criteria");
     if (criteria == nullptr) criteria = optional_member(specification, "options");
+    if (criteria != nullptr && criteria->is_null()) criteria = nullptr;
     const Json* raw_instructions = optional_member(specification, "instructions");
     if (raw_instructions == nullptr) raw_instructions = optional_member(specification, "question");
     const bool is_noul = type == "noul" || type == "bool";
@@ -207,7 +269,7 @@ Question parse_question(const std::string& id, const Json& specification) {
         Json choices;
         if (criteria != nullptr && criteria->is_array()) {
             choices = Json::object();
-            for (const auto& value : *criteria) choices[text(value)] = nullptr;
+            for (const auto& value : *criteria) choices[python_str(value)] = nullptr;
             criteria = &choices;
         }
         if (criteria == nullptr || !criteria->is_object() || criteria->size() < 2 ||
@@ -225,9 +287,17 @@ Question parse_question(const std::string& id, const Json& specification) {
             for (const auto& value : *criteria) levels.push_back(value);
         } else if (criteria != nullptr && criteria->is_object()) {
             std::vector<std::pair<double, Json>> sorted;
-            for (const auto& item : criteria->items())
-                sorted.emplace_back(std::stod(item.key()), item.value());
-            std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
+            for (const auto& item : criteria->items()) {
+                std::size_t consumed = 0;
+                const double level = std::stod(item.key(), &consumed);
+                while (consumed < item.key().size() &&
+                       std::isspace(static_cast<unsigned char>(item.key()[consumed])))
+                    ++consumed;
+                if (consumed != item.key().size())
+                    throw std::invalid_argument("score criteria level is not numeric: " + item.key());
+                sorted.emplace_back(level, item.value());
+            }
+            std::stable_sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
                 return left.first < right.first;
             });
             for (auto& item : sorted) levels.push_back(std::move(item.second));

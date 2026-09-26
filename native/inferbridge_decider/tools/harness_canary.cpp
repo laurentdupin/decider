@@ -71,14 +71,25 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 4) {
-        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN]\n";
+    if (argc < 3 || argc > 5) {
+        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics]\n";
         return 2;
     }
     try {
         const std::string model_path = argv[1];
         std::string request_json = read_file(argv[2]);
-        const std::string backend = argc == 4 ? argv[3] : "CPU";
+        std::string backend = "CPU";
+        bool diagnostics = false;
+        if (argc >= 4) {
+            if (std::string(argv[3]) == "--diagnostics") diagnostics = true;
+            else backend = argv[3];
+        }
+        if (argc == 5) {
+            if (std::string(argv[4]) != "--diagnostics" || diagnostics)
+                throw std::runtime_error("the final argument must be --diagnostics");
+            diagnostics = true;
+        }
+        const std::string submit_parameters = diagnostics ? "{\"diagnostics\":true}" : "";
 
         ibrh_api api{};
         if (ibrh_get_api(IBRH_CURRENT_API_VERSION, sizeof(api), &api) != IBRH_OK)
@@ -125,6 +136,7 @@ int main(int argc, char** argv) {
             submit.outputs = &output_binding;
             submit.output_count = 1;
             submit.source_frame_id = 1;
+            submit.parameters_json = view(submit_parameters);
             check(api, api.submit(model, sizeof(submit), &submit, &job), model, "submit");
 
             for (;;) {

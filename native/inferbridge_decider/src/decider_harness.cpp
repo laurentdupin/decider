@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -83,6 +84,7 @@ struct ModelConfig {
     std::uint32_t batch_size = 512;
     std::uint32_t threads = std::max(1U, std::thread::hardware_concurrency());
     std::uint32_t max_rows = 256;
+    std::uint32_t max_outputs_per_batch = 32;
     std::uint32_t max_state_tokens = 32768;
     std::uint64_t max_output_bytes = kDefaultOutputBytes;
     std::string model_name = "decider-native";
@@ -98,6 +100,35 @@ void require_temperature(double value, const char* label) {
         throw std::invalid_argument(std::string(label) + " must be finite and positive");
 }
 
+double base_temperature(const decider::native::Json& value, const char* label) {
+    if (value.is_boolean())
+        throw std::invalid_argument(std::string(label) + " must be a finite number > 0");
+    double result = 0.0;
+    if (value.is_number()) {
+        result = value.get<double>();
+    } else if (value.is_string()) {
+        std::size_t consumed = 0;
+        result = std::stod(value.get_ref<const std::string&>(), &consumed);
+        const auto& source = value.get_ref<const std::string&>();
+        while (consumed < source.size() &&
+               std::isspace(static_cast<unsigned char>(source[consumed])))
+            ++consumed;
+        if (consumed != source.size())
+            throw std::invalid_argument(std::string(label) + " must be a finite number > 0");
+    } else {
+        throw std::invalid_argument(std::string(label) + " must be a finite number > 0");
+    }
+    require_temperature(result, label);
+    return result;
+}
+
+std::string python_scalar_string(const decider::native::Json& value) {
+    if (value.is_string()) return value.get<std::string>();
+    if (value.is_null()) return "None";
+    if (value.is_boolean()) return value.get<bool>() ? "True" : "False";
+    return value.dump();
+}
+
 ModelConfig parse_model_config(const decider::native::Json& checkpoint,
                                const decider::native::Json& parameters) {
     ModelConfig result;
@@ -105,36 +136,56 @@ ModelConfig parse_model_config(const decider::native::Json& checkpoint,
     result.batch_size = parameters.value("batch_size", result.batch_size);
     result.threads = parameters.value("threads", result.threads);
     result.max_rows = parameters.value("max_rows", result.max_rows);
+    result.max_outputs_per_batch = parameters.value(
+        "max_outputs_per_batch", result.max_outputs_per_batch);
     result.max_state_tokens = parameters.value("max_state_tokens", result.max_state_tokens);
     result.max_output_bytes = parameters.value("max_output_bytes", result.max_output_bytes);
     result.isolated_levels = checkpoint.value("isolated_levels", false);
-    result.temperature = checkpoint.value("temperature", 1.0);
+    if (const auto found = checkpoint.find("temperature"); found != checkpoint.end())
+        result.temperature = base_temperature(*found, "temperature");
     result.choice_temperature = result.temperature;
     result.score_temperature = result.temperature;
     result.noul_temperature = result.temperature;
-    if (const auto found = checkpoint.find("temperature_by_type");
-        found != checkpoint.end() && found->is_object()) {
-        result.choice_temperature = found->value("choice", result.temperature);
-        result.score_temperature = found->value("score", result.temperature);
-        result.noul_temperature = found->value("noul", result.temperature);
+    if (const auto found = checkpoint.find("temperature_by_type"); found != checkpoint.end() && !found->is_null()) {
+        if (!found->is_object())
+            throw std::invalid_argument("temperature_by_type must be a map");
+        for (const auto& item : found->items()) {
+            if (item.key() != "choice" && item.key() != "score" && item.key() != "noul")
+                throw std::invalid_argument("temperature_by_type has unknown key: " + item.key());
+            if (!item.value().is_number() || item.value().is_boolean())
+                throw std::invalid_argument("temperature_by_type values must be finite numbers > 0");
+            const double value = item.value().get<double>();
+            require_temperature(value, "temperature_by_type value");
+            if (item.key() == "choice") result.choice_temperature = value;
+            if (item.key() == "score") result.score_temperature = value;
+            if (item.key() == "noul") result.noul_temperature = value;
+        }
     }
     if (const auto found = parameters.find("temperature"); found != parameters.end()) {
-        result.temperature = found->get<double>();
+        result.temperature = base_temperature(*found, "temperature");
         result.choice_temperature = result.temperature;
         result.score_temperature = result.temperature;
         result.noul_temperature = result.temperature;
     }
     if (const auto found = parameters.find("isolated_levels"); found != parameters.end())
         result.isolated_levels = found->get<bool>();
-    const std::string version = checkpoint.value("version", std::string("native"));
+    const auto version_member = checkpoint.find("version");
+    const std::string version = version_member == checkpoint.end()
+        ? "native" : python_scalar_string(*version_member);
     result.model_name = parameters.value("model_name", "decider-" + version);
-    const std::string layout = checkpoint.value("layout",
-        checkpoint.value("chat_template", false) ? "chat" : "plain");
+    const auto chat_member = checkpoint.find("chat_template");
+    const bool chat_template = chat_member != checkpoint.end() &&
+        chat_member->is_boolean() && chat_member->get<bool>();
+    const std::string layout = checkpoint.value("layout", chat_template ? "chat" : "plain");
+    if (layout == "plain" && chat_template)
+        throw std::invalid_argument(
+            "decider_config.json contradicts layout='plain' with chat_template=true");
     if (layout != "plain")
         throw std::invalid_argument(
             "the initial native harness supports only a state-first plain-layout checkpoint");
     if (result.context_size < 128 || result.batch_size == 0 || result.threads == 0 ||
-        result.max_rows == 0 || result.max_state_tokens == 0 ||
+        result.max_rows == 0 || result.max_outputs_per_batch == 0 ||
+        result.max_outputs_per_batch > result.batch_size || result.max_state_tokens == 0 ||
         result.max_output_bytes < 1024 || result.max_output_bytes > kMaximumOutputBytes)
         throw std::invalid_argument("invalid Decider native model parameters");
     require_temperature(result.choice_temperature, "choice temperature");
@@ -155,6 +206,17 @@ std::vector<llama_token> tokenize(const llama_vocab* vocabulary, const std::stri
     if (count < 0) throw std::runtime_error("llama.cpp tokenization failed");
     tokens.resize(static_cast<std::size_t>(count));
     return tokens;
+}
+
+std::vector<std::string> candidate_label_names() {
+    std::vector<std::string> names;
+    names.reserve(26 + 26 * 26);
+    for (char first = 'A'; first <= 'Z'; ++first)
+        names.emplace_back(1, first);
+    for (char first = 'A'; first <= 'Z'; ++first)
+        for (char second = 'A'; second <= 'Z'; ++second)
+            names.push_back(std::string(1, first) + second);
+    return names;
 }
 
 void fill_text_port(std::uint32_t direction, std::uint32_t width,
@@ -203,13 +265,20 @@ double temperature_for(const ModelConfig& config, decider::native::AnswerType ty
 
 std::vector<double> selected_softmax(const float* logits,
                                      const std::vector<llama_token>& labels,
-                                     std::size_t count, double temperature) {
+                                     std::size_t count, double temperature,
+                                     std::vector<double>* raw_logits = nullptr) {
     if (count < 2 || count > labels.size())
-        throw std::invalid_argument("the initial native harness supports 2..10 options per row");
+        throw std::invalid_argument("the native harness supports 2..255 options per row");
     std::vector<double> values(count);
+    if (raw_logits != nullptr) {
+        raw_logits->clear();
+        raw_logits->reserve(count);
+    }
     double maximum = -std::numeric_limits<double>::infinity();
     for (std::size_t index = 0; index < count; ++index) {
-        values[index] = static_cast<double>(logits[labels[index]]) / temperature;
+        const double raw = static_cast<double>(logits[labels[index]]);
+        if (raw_logits != nullptr) raw_logits->push_back(raw);
+        values[index] = raw / temperature;
         maximum = std::max(maximum, values[index]);
     }
     double total = 0.0;
@@ -259,38 +328,114 @@ struct ibrh_job {
     std::uint64_t source_frame_id = 0;
     std::atomic<std::uint32_t> state{IBRH_JOB_QUEUED};
     std::atomic<bool> cancel{false};
+    bool diagnostics = false;
     std::thread worker;
     std::string error;
 };
 
 namespace {
 
-std::vector<double> evaluate_row(ibrh_job* job,
-                                 const std::vector<llama_token>& tokens,
-                                 std::size_t option_count,
-                                 decider::native::AnswerType type) {
+struct PreparedRow {
+    std::vector<llama_token> tokens;
+    std::vector<std::size_t> slots;
+    std::vector<std::size_t> option_counts;
+    std::vector<decider::native::AnswerType> types;
+};
+
+struct EvaluatedRow {
+    std::vector<std::vector<double>> probabilities;
+    std::vector<std::vector<double>> selected_logits;
+};
+
+void append_prompt_block(const ibrh_model* model, PreparedRow& prepared,
+                         const decider::native::Row& row,
+                         std::size_t answer_index, bool multi_question) {
+    if (row.options.size() <= 10) {
+        auto block = tokenize(model->vocabulary,
+            decider::native::plain_narrow_block(row, answer_index, multi_question));
+        prepared.tokens.insert(prepared.tokens.end(), block.begin(), block.end());
+        return;
+    }
+    std::string header = "\n\nQuestion";
+    if (multi_question) header += " " + std::to_string(answer_index + 1);
+    header += ": " + row.question + "\nOptions:";
+    auto piece = tokenize(model->vocabulary, header);
+    prepared.tokens.insert(prepared.tokens.end(), piece.begin(), piece.end());
+    const auto open = tokenize(model->vocabulary, "\n(");
+    for (std::size_t index = 0; index < row.options.size(); ++index) {
+        prepared.tokens.insert(prepared.tokens.end(), open.begin(), open.end());
+        prepared.tokens.push_back(model->labels[index]);
+        piece = tokenize(model->vocabulary, ") " + row.options[index]);
+        prepared.tokens.insert(prepared.tokens.end(), piece.begin(), piece.end());
+    }
+    std::string tail = "\nAnswer";
+    if (multi_question) tail += " " + std::to_string(answer_index + 1);
+    tail += ": (";
+    piece = tokenize(model->vocabulary, tail);
+    prepared.tokens.insert(prepared.tokens.end(), piece.begin(), piece.end());
+}
+
+EvaluatedRow evaluate_row(ibrh_job* job, const PreparedRow& row) {
     ibrh_model* model = job->model;
-    if (tokens.empty()) throw std::runtime_error("Decider prompt produced no tokens");
-    if (tokens.size() > model->config.context_size)
+    if (row.tokens.empty()) throw std::runtime_error("Decider prompt produced no tokens");
+    if (row.tokens.size() > model->config.context_size)
         throw std::runtime_error("Decider prompt exceeds context_size");
+    if (row.slots.size() != row.option_counts.size() || row.slots.size() != row.types.size())
+        throw std::logic_error("Decider prompt slot metadata is inconsistent");
     llama_memory_clear(llama_get_memory(model->context), true);
+    EvaluatedRow evaluated;
+    evaluated.probabilities.reserve(row.slots.size());
+    evaluated.selected_logits.reserve(row.slots.size());
     std::size_t offset = 0;
-    while (offset < tokens.size()) {
+    std::size_t next_slot = 0;
+    while (offset < row.tokens.size()) {
         if (job->cancel.load()) throw std::runtime_error("cancelled");
-        const std::size_t count = std::min<std::size_t>(
-            model->config.batch_size, tokens.size() - offset);
-        llama_batch batch = llama_batch_get_one(
-            const_cast<llama_token*>(tokens.data() + offset), static_cast<int>(count));
+        std::size_t end = std::min<std::size_t>(
+            offset + model->config.batch_size, row.tokens.size());
+        const auto first = std::lower_bound(row.slots.begin(), row.slots.end(), offset);
+        const auto limit = first + std::min<std::size_t>(
+            model->config.max_outputs_per_batch,
+            static_cast<std::size_t>(row.slots.end() - first));
+        if (limit != row.slots.end() && *limit < end) end = *limit;
+        const std::size_t count = end - offset;
+        llama_batch batch = llama_batch_init(static_cast<int>(count), 0, 1);
+        batch.n_tokens = static_cast<int>(count);
+        const std::size_t chunk_slot_begin = next_slot;
+        for (std::size_t local = 0; local < count; ++local) {
+            const std::size_t global = offset + local;
+            batch.token[local] = row.tokens[global];
+            batch.pos[local] = static_cast<llama_pos>(global);
+            batch.n_seq_id[local] = 1;
+            batch.seq_id[local][0] = 0;
+            batch.logits[local] = next_slot < row.slots.size() && row.slots[next_slot] == global;
+            if (batch.logits[local]) ++next_slot;
+        }
         const int result = llama_decode(model->context, batch);
-        if (result != 0)
+        if (result != 0) {
+            llama_batch_free(batch);
             throw std::runtime_error("llama.cpp prompt decode failed with code " +
                                      std::to_string(result));
+        }
+        for (std::size_t slot = chunk_slot_begin; slot < next_slot; ++slot) {
+            const int local = static_cast<int>(row.slots[slot] - offset);
+            const float* logits = llama_get_logits_ith(model->context, local);
+            if (logits == nullptr) {
+                llama_batch_free(batch);
+                throw std::runtime_error("llama.cpp returned no answer-slot logits");
+            }
+            std::vector<double> raw;
+            evaluated.probabilities.push_back(selected_softmax(
+                logits, model->labels, row.option_counts[slot],
+                temperature_for(model->config, row.types[slot]),
+                job->diagnostics ? &raw : nullptr));
+            if (job->diagnostics) evaluated.selected_logits.push_back(std::move(raw));
+        }
+        llama_batch_free(batch);
         offset += count;
     }
-    const float* logits = llama_get_logits_ith(model->context, -1);
-    if (logits == nullptr) throw std::runtime_error("llama.cpp returned no answer-slot logits");
-    return selected_softmax(logits, model->labels, option_count,
-                            temperature_for(model->config, type));
+    if (evaluated.probabilities.size() != row.slots.size())
+        throw std::runtime_error("not all Decider answer slots produced logits");
+    return evaluated;
 }
 
 void run_job(ibrh_job* job, std::string request_text,
@@ -299,42 +444,71 @@ void run_job(ibrh_job* job, std::string request_text,
         job->state = IBRH_JOB_RUNNING;
         auto plan = decider::native::parse_system_one(
             request_text, job->model->config.isolated_levels);
-        if (!plan.independent)
-            throw std::invalid_argument(
-                "the initial native harness supports independent=true requests only");
         if (plan.rows.size() > job->model->config.max_rows)
             throw std::invalid_argument("request expands beyond max_rows");
 
-        std::vector<std::vector<llama_token>> token_rows;
-        token_rows.reserve(plan.rows.size());
-        for (const auto& row : plan.rows) {
-            if (row.options.size() > 10)
-                throw std::invalid_argument(
-                    "the initial native harness does not yet support wide (>10 option) labels");
+        std::vector<PreparedRow> prepared_rows;
+        prepared_rows.reserve(plan.independent ? plan.rows.size() : 1);
+        const auto state_tokens = [&] {
             auto tokens = tokenize(job->model->vocabulary,
                 "Context:\n" + plan.rendered_state);
             if (tokens.size() > job->model->config.max_state_tokens)
                 tokens.resize(job->model->config.max_state_tokens);
-            auto suffix = tokenize(job->model->vocabulary,
-                decider::native::plain_narrow_block(row, 0, false));
-            tokens.insert(tokens.end(), suffix.begin(), suffix.end());
-            token_rows.push_back(std::move(tokens));
+            return tokens;
+        }();
+        for (std::size_t row_index = 0; row_index < plan.rows.size(); ++row_index) {
+            const auto& row = plan.rows[row_index];
+            if (plan.independent || prepared_rows.empty()) {
+                prepared_rows.push_back(PreparedRow{});
+                prepared_rows.back().tokens = state_tokens;
+            }
+            PreparedRow& prepared = prepared_rows.back();
+            append_prompt_block(job->model, prepared, row,
+                plan.independent ? 0 : row_index,
+                !plan.independent && plan.rows.size() > 1);
+            prepared.slots.push_back(prepared.tokens.size() - 1);
+            prepared.option_counts.push_back(row.options.size());
+            prepared.types.push_back(row.temperature_type);
         }
 
         std::vector<std::vector<double>> probabilities;
         probabilities.reserve(plan.rows.size());
-        for (std::size_t index = 0; index < plan.rows.size(); ++index) {
+        decider::native::Json diagnostic_rows = decider::native::Json::array();
+        for (const auto& prepared : prepared_rows) {
             if (job->cancel.load()) {
                 job->state = IBRH_JOB_CANCELLED;
                 return;
             }
-            probabilities.push_back(evaluate_row(
-                job, token_rows[index], plan.rows[index].options.size(),
-                plan.rows[index].temperature_type));
+            auto evaluated = evaluate_row(job, prepared);
+            if (job->diagnostics) {
+                decider::native::Json item = decider::native::Json::object();
+                item["token_ids"] = prepared.tokens;
+                item["slots"] = prepared.slots;
+                item["option_counts"] = prepared.option_counts;
+                decider::native::Json types = decider::native::Json::array();
+                for (const auto type : prepared.types)
+                    types.push_back(decider::native::answer_type_name(type));
+                item["types"] = std::move(types);
+                item["selected_logits"] = std::move(evaluated.selected_logits);
+                item["probabilities"] = evaluated.probabilities;
+                diagnostic_rows.push_back(std::move(item));
+            }
+            probabilities.insert(probabilities.end(),
+                                 std::make_move_iterator(evaluated.probabilities.begin()),
+                                 std::make_move_iterator(evaluated.probabilities.end()));
         }
-        const auto response = decider::native::assemble_response(
+        std::vector<std::vector<llama_token>> token_rows;
+        token_rows.reserve(prepared_rows.size());
+        for (const auto& row : prepared_rows) token_rows.push_back(row.tokens);
+        auto response = decider::native::assemble_response(
             plan, probabilities, job->model->config.model_name,
             unique_tokens(token_rows));
+        if (job->diagnostics) {
+            decider::native::Json diagnostics = decider::native::Json::object();
+            diagnostics["label_token_ids"] = job->model->labels;
+            diagnostics["rows"] = std::move(diagnostic_rows);
+            response["_diagnostics"] = std::move(diagnostics);
+        }
         const std::string serialized = response.dump();
         if (serialized.size() + 1 > output_capacity)
             throw std::runtime_error("response exceeds configured max_output_bytes");
@@ -443,22 +617,26 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
         model->model = llama_model_load_from_file(model_path.u8string().c_str(), model_parameters);
         if (model->model == nullptr) throw std::runtime_error("llama.cpp failed to load Decider GGUF");
         model->vocabulary = llama_model_get_vocab(model->model);
-        for (char label = 'A'; label <= 'J'; ++label) {
-            const auto encoded = tokenize(model->vocabulary, std::string(1, label));
-            if (encoded.size() != 1) {
+        for (const auto& label : candidate_label_names()) {
+            const auto encoded = tokenize(model->vocabulary, label);
+            if (encoded.size() == 1) model->labels.push_back(encoded.front());
+            if (model->labels.size() == 255) break;
+        }
+        if (model->labels.size() != 255 ||
+            std::unordered_set<llama_token>(model->labels.begin(), model->labels.end()).size() !=
+                model->labels.size()) {
                 llama_model_free(model->model);
                 model->model = nullptr;
-                throw std::runtime_error("Decider label does not map to one GGUF token");
-            }
-            model->labels.push_back(encoded.front());
+                throw std::runtime_error(
+                    "GGUF tokenizer does not provide 255 distinct Decider label tokens");
         }
         llama_context_params context = llama_context_default_params();
         context.n_ctx = model->config.context_size;
         context.n_batch = model->config.batch_size;
         context.n_ubatch = model->config.batch_size;
         context.n_seq_max = 1;
-        context.n_outputs_max = 1;
-        context.n_outputs_max_per_seq = 1;
+        context.n_outputs_max = model->config.max_outputs_per_batch;
+        context.n_outputs_max_per_seq = model->config.max_outputs_per_batch;
         context.n_threads = static_cast<int>(model->config.threads);
         context.n_threads_batch = static_cast<int>(model->config.threads);
         context.no_perf = true;
@@ -544,6 +722,13 @@ ibrh_result IBRH_CALL submit(ibrh_model* model, std::size_t size,
         auto job = std::make_unique<ibrh_job>();
         job->model = model;
         job->source_frame_id = request->source_frame_id;
+        const std::string submit_parameters = as_string(request->parameters_json);
+        if (!submit_parameters.empty()) {
+            const auto parameters = decider::native::Json::parse(submit_parameters);
+            if (!parameters.is_object())
+                throw std::invalid_argument("submit parameters_json must be an object");
+            job->diagnostics = parameters.value("diagnostics", false);
+        }
         std::string request_text(input_data, static_cast<std::size_t>(input.byte_size));
         while (!request_text.empty() && request_text.back() == '\0') request_text.pop_back();
         job->worker = std::thread(run_job, job.get(), std::move(request_text),
