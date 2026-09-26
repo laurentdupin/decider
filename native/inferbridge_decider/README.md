@@ -58,6 +58,11 @@ export a local Hugging Face checkpoint. The exporter refuses layouts the
 current harness cannot reproduce and packages `decider_config.json` beside the
 GGUF model.
 
+The exporter excludes Qwen NextN speculative-draft metadata and tensors. They
+are not used by Decider inference, and advertising a missing NextN layer causes
+the pinned llama.cpp loader to expect draft-head tensors that are absent from
+the released checkpoint.
+
 ```powershell
 python -m venv .venv-gguf
 .venv-gguf\Scripts\python -m pip install `
@@ -83,6 +88,8 @@ Append `--diagnostics` to include exact prompt token IDs, answer-slot positions,
 the 255 label token IDs, and raw selected logits in the canary response. This
 output is intended for Python/native parity fixtures and is disabled for normal
 InferBridge submissions.
+Use `--output out\parity\native.json` to write the canary response directly to
+a comparison fixture.
 
 Generate the matching Python-side fixture from the original checkpoint with:
 
@@ -96,11 +103,33 @@ Compare each row's `token_ids`, `slots`, and `selected_logits` with the native
 diagnostic response before comparing the calibrated probabilities and final
 response. Token and slot arrays must match exactly; logits and probabilities
 use measured tolerances because the PyTorch and llama.cpp kernels differ.
+The comparator defaults reflect the first BF16 CPU parity measurement
+(`0.1` raw logits and `0.02` probabilities/rounded response fields); categorical
+answers, token metadata, object structure, and token usage remain exact.
 
 ```powershell
 python native\inferbridge_decider\tools\compare_parity.py `
   out\parity\python.json out\parity\native.json
 ```
+
+`examples/request_packed_wide.json` is the packed conformance probe: it places
+a 12-option wide Choice, Score, and Noul in one physical prompt so every slot
+and per-type temperature is checked in a single chunked logical forward.
+
+## BF16 parity status
+
+The released `Mapika/decider-2b` v11 checkpoint was converted with the pinned
+llama.cpp revision and checked on CPU against Transformers 5.17/PyTorch 2.11:
+
+- Independent Choice plus isolated Score: exact tokens, slots, labels, usage,
+  and categorical answer; maximum deltas were `0.05734` logits, `0.01152`
+  probabilities, and `0.0137` across rounded numeric response fields.
+- Packed 12-option Choice plus Score and Noul: exact tokens, slots, labels,
+  usage, and categorical answers; maximum deltas were `0.07888` logits,
+  `0.00417` probabilities, and `0.01` across numeric response fields.
+
+These are compatibility measurements, not a claim of bitwise equality between
+the PyTorch and llama.cpp kernels.
 
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
 `VULKAN` as the final argument only in a build configured with

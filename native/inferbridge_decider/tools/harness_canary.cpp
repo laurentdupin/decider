@@ -71,8 +71,8 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 5) {
-        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics]\n";
+    if (argc < 3) {
+        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics] [--output FILE]\n";
         return 2;
     }
     try {
@@ -80,14 +80,18 @@ int main(int argc, char** argv) {
         std::string request_json = read_file(argv[2]);
         std::string backend = "CPU";
         bool diagnostics = false;
-        if (argc >= 4) {
-            if (std::string(argv[3]) == "--diagnostics") diagnostics = true;
-            else backend = argv[3];
-        }
-        if (argc == 5) {
-            if (std::string(argv[4]) != "--diagnostics" || diagnostics)
-                throw std::runtime_error("the final argument must be --diagnostics");
-            diagnostics = true;
+        std::string output_path;
+        for (int index = 3; index < argc; ++index) {
+            const std::string argument = argv[index];
+            if (argument == "--diagnostics") {
+                diagnostics = true;
+            } else if (argument == "--output" && index + 1 < argc) {
+                output_path = argv[++index];
+            } else if (argument == "CPU" || argument == "VULKAN") {
+                backend = argument;
+            } else {
+                throw std::runtime_error("unknown argument: " + argument);
+            }
         }
         const std::string submit_parameters = diagnostics ? "{\"diagnostics\":true}" : "";
 
@@ -147,7 +151,13 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("native inference failed: " + last_error(api, job));
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            std::cout << output.data() << '\n';
+            if (output_path.empty()) {
+                std::cout << output.data() << '\n';
+            } else {
+                std::ofstream file(output_path, std::ios::binary);
+                if (!file) throw std::runtime_error("cannot open output file: " + output_path);
+                file << output.data() << '\n';
+            }
             api.job_release(job);
             job = nullptr;
             api.model_unload(model);

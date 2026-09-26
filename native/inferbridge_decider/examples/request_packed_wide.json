@@ -1,0 +1,40 @@
+{
+  "state": {
+    "incident": "Several customers report duplicate card charges after checkout.",
+    "region": "EU"
+  },
+  "questions": {
+    "category": {
+      "type": "choice",
+      "instructions": "Which category best describes the incident?",
+      "criteria": {
+        "L0": "account access",
+        "L1": "application crash",
+        "L2": "billing dispute",
+        "L3": "data export",
+        "L4": "delivery delay",
+        "L5": "duplicate charge",
+        "L6": "feature request",
+        "L7": "fraud report",
+        "L8": "password reset",
+        "L9": "performance issue",
+        "L10": "subscription cancellation",
+        "L11": "technical question"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this incident?",
+      "criteria": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "refund": {
+      "type": "noul",
+      "instructions": "Should the affected charges be reviewed for a refund?"
+    }
+  },
+  "independent": false
+}

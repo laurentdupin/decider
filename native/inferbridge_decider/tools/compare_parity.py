@@ -13,12 +13,42 @@ def maximum_delta(left, right) -> float:
     return max((abs(float(a) - float(b)) for a, b in zip(left, right)), default=0.0)
 
 
+def response_delta(expected, actual, tolerance: float, path: str = "response") -> float:
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict) or expected.keys() != actual.keys():
+            raise AssertionError(f"{path} object keys differ")
+        return max(
+            (response_delta(value, actual[key], tolerance, f"{path}.{key}")
+             for key, value in expected.items()),
+            default=0.0,
+        )
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(expected) != len(actual):
+            raise AssertionError(f"{path} list shape differs")
+        return max(
+            (response_delta(left, right, tolerance, f"{path}[{index}]")
+             for index, (left, right) in enumerate(zip(expected, actual))),
+            default=0.0,
+        )
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        delta = abs(float(expected) - float(actual))
+        if path.startswith("response.usage.") and delta != 0:
+            raise AssertionError(f"{path} differs: {expected} != {actual}")
+        if delta > tolerance:
+            raise AssertionError(f"{path} delta {delta} exceeds {tolerance}")
+        return delta
+    if expected != actual:
+        raise AssertionError(f"{path} differs: {expected!r} != {actual!r}")
+    return 0.0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_fixture", type=Path)
     parser.add_argument("native_response", type=Path)
     parser.add_argument("--logit-atol", type=float, default=0.1)
-    parser.add_argument("--probability-atol", type=float, default=0.01)
+    parser.add_argument("--probability-atol", type=float, default=0.02)
+    parser.add_argument("--response-atol", type=float, default=0.02)
     args = parser.parse_args()
 
     reference = json.loads(args.python_fixture.read_text(encoding="utf-8"))
@@ -48,11 +78,11 @@ def main() -> int:
         raise AssertionError(
             f"maximum probability delta {max_probability} exceeds {args.probability_atol}"
         )
-    if reference["response"] != native:
-        raise AssertionError("final response differs")
+    max_response = response_delta(reference["response"], native, args.response_atol)
     print(
         f"PARITY_OK rows={len(reference['rows'])} "
-        f"max_logit_delta={max_logit:.8g} max_probability_delta={max_probability:.8g}"
+        f"max_logit_delta={max_logit:.8g} max_probability_delta={max_probability:.8g} "
+        f"max_response_delta={max_response:.8g}"
     )
     return 0
 

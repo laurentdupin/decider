@@ -31,6 +31,8 @@ constexpr std::uint64_t kMaximumOutputBytes = 16U * 1024U * 1024U;
 std::once_flag g_backend_once;
 std::mutex g_error_mutex;
 std::string g_last_error;
+std::mutex g_llama_log_mutex;
+std::string g_llama_log;
 
 std::string as_string(ibrh_string_view value) {
     return value.data == nullptr ? std::string() : std::string(value.data, value.size);
@@ -55,7 +57,24 @@ bool valid_struct(std::size_t size, const T* value) {
         valid_api(value->api_version);
 }
 
-void quiet_llama_log(ggml_log_level, const char*, void*) {}
+void capture_llama_log(ggml_log_level, const char* message, void*) {
+    if (message == nullptr) return;
+    std::lock_guard<std::mutex> guard(g_llama_log_mutex);
+    g_llama_log += message;
+    constexpr std::size_t maximum = 32U * 1024U;
+    if (g_llama_log.size() > maximum)
+        g_llama_log.erase(0, g_llama_log.size() - maximum);
+}
+
+void clear_llama_log() {
+    std::lock_guard<std::mutex> guard(g_llama_log_mutex);
+    g_llama_log.clear();
+}
+
+std::string llama_log_tail() {
+    std::lock_guard<std::mutex> guard(g_llama_log_mutex);
+    return g_llama_log;
+}
 
 decider::native::Json read_json_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -557,7 +576,7 @@ ibrh_result IBRH_CALL runtime_create(std::size_t size,
     *output = nullptr;
     try {
         std::call_once(g_backend_once, [] {
-            llama_log_set(quiet_llama_log, nullptr);
+            llama_log_set(capture_llama_log, nullptr);
             llama_backend_init();
         });
         auto runtime = std::make_unique<ibrh_runtime>();
@@ -614,8 +633,13 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
         model_parameters.n_gpu_layers = runtime->backend == "VULKAN" ? -1 : 0;
         model_parameters.split_mode = LLAMA_SPLIT_MODE_NONE;
         model_parameters.load_mtp = false;
+        clear_llama_log();
         model->model = llama_model_load_from_file(model_path.u8string().c_str(), model_parameters);
-        if (model->model == nullptr) throw std::runtime_error("llama.cpp failed to load Decider GGUF");
+        if (model->model == nullptr) {
+            const std::string detail = llama_log_tail();
+            throw std::runtime_error("llama.cpp failed to load Decider GGUF" +
+                (detail.empty() ? std::string() : ":\n" + detail));
+        }
         model->vocabulary = llama_model_get_vocab(model->model);
         for (const auto& label : candidate_label_names()) {
             const auto encoded = tokenize(model->vocabulary, label);

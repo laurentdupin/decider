@@ -69,6 +69,7 @@ def main() -> int:
         str(output),
         "--outtype",
         args.outtype,
+        "--no-nextn",
     ]
     if args.use_temp_file:
         command.append("--use-temp-file")
@@ -81,6 +82,7 @@ def main() -> int:
         "schema_version": 1,
         "model_file": output.name,
         "outtype": args.outtype,
+        "nextn_excluded": True,
         "source_config_sha256": sha256(config_path),
         "llama_cpp_commit": subprocess.check_output(
             ["git", "-C", str(LLAMA), "rev-parse", "HEAD"], text=True
