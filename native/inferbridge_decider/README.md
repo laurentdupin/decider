@@ -54,9 +54,10 @@ prompt/logit parity fixtures.
 ## Export a checkpoint
 
 Install the pinned converter requirements in a dedicated environment, then
-export a local Hugging Face checkpoint. The exporter refuses layouts the
-current harness cannot reproduce and packages `decider_config.json` beside the
-GGUF model.
+export a local Hugging Face checkpoint. The exporter packages
+`decider_config.json`, tokenizer-derived label IDs, model provenance, and—when
+declared—exact chat head/tail text and tokens beside the GGUF model. The native
+loader validates the packaged label table against the GGUF tokenizer.
 
 The exporter excludes Qwen NextN speculative-draft metadata and tensors. They
 are not used by Decider inference, and advertising a missing NextN layer causes

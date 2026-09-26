@@ -654,6 +654,19 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
                 throw std::runtime_error(
                     "GGUF tokenizer does not provide 255 distinct Decider label tokens");
         }
+        const auto package_path = model_root / "inferbridge-decider-export.json";
+        if (std::filesystem::is_regular_file(package_path)) {
+            const auto package = read_json_file(package_path);
+            if (const auto found = package.find("label_token_ids"); found != package.end()) {
+                if (!found->is_array() ||
+                    found->get<std::vector<llama_token>>() != model->labels) {
+                    llama_model_free(model->model);
+                    model->model = nullptr;
+                    throw std::runtime_error(
+                        "GGUF label tokens do not match inferbridge-decider-export.json");
+                }
+            }
+        }
         llama_context_params context = llama_context_default_params();
         context.n_ctx = model->config.context_size;
         context.n_batch = model->config.batch_size;
