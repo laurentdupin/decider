@@ -47,6 +47,22 @@ cmake --build out/decider-native --config Release
 ctest --test-dir out/decider-native -C Release --output-on-failure
 ```
 
+Configure a Vulkan harness with the same ABI by enabling the llama.cpp Vulkan
+backend. On Windows, `VULKAN_SDK` must name an installed SDK before configuring:
+
+```powershell
+$env:VULKAN_SDK = 'C:\VulkanSDK\1.4.350.0'
+cmake -S native/inferbridge_decider -B out/decider-native-vulkan `
+  -DDECIDER_BUILD_HARNESS=ON -DDECIDER_BUILD_TESTS=ON `
+  -DDECIDER_BUILD_CANARY=ON -DDECIDER_LLAMA_VULKAN=ON
+cmake --build out/decider-native-vulkan --config Release --parallel
+ctest --test-dir out/decider-native-vulkan -C Release --output-on-failure
+```
+
+Selecting `VULKAN` in the InferBridge runtime request makes the harness require
+a registered Vulkan GPU and sets `n_gpu_layers=-1`, so all model layers are
+offloaded. It does not silently fall back to CPU when Vulkan is unavailable.
+
 `third_party/llama.cpp` is pinned to the revision validated by the existing
 Qwen GGUF harness. Do not advance it without compiling the ABI and rerunning
 prompt/logit parity fixtures.
@@ -131,6 +147,36 @@ llama.cpp revision and checked on CPU against Transformers 5.17/PyTorch 2.11:
 
 These are compatibility measurements, not a claim of bitwise equality between
 the PyTorch and llama.cpp kernels.
+
+## Vulkan status
+
+The Vulkan build was exercised with the BF16 v11 GGUF on an NVIDIA GeForce GTX
+1080 8 GB. All ABI/protocol tests passed, and the packed conformance probe
+remained within the CPU/Python parity envelope: maximum deltas were `0.07722`
+logits, `0.00413` probabilities, and `0.0042` across rounded response fields.
+
+After the Vulkan driver shader cache was populated, five fresh-process runs of
+each simple example produced these median inference times:
+
+| Example | Result | Vulkan inference | CPU inference |
+| --- | --- | ---: | ---: |
+| `simple_choice.json` | `billing` (`p=0.9703`) | `63.37 ms` | `605.16 ms` |
+| `simple_noul.json` | `0.7912` | `57.47 ms` | `593.73 ms` |
+| `simple_score.json` | `1.32` | `51.45 ms` | `608.35 ms` |
+
+Fresh canary processes took about `2.34`–`2.38 s` to load the model. InferBridge
+keeps the loaded runtime alive, so this is startup cost rather than per-request
+latency. The first inference on a machine can additionally compile/cache Vulkan
+pipelines; the measured first uncached request took `1.11 s`.
+
+Run a timed Vulkan decision with:
+
+```powershell
+out\decider-native-vulkan\Release\decider_native_canary.exe `
+  C:\models\decider-2b-native\decider-2b-bf16.gguf `
+  native\inferbridge_decider\examples\simple_choice.json `
+  VULKAN --timing
+```
 
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
 `VULKAN` as the final argument only in a build configured with
