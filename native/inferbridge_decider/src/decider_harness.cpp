@@ -870,7 +870,9 @@ ibrh_result IBRH_CALL model_load(ibrh_runtime* runtime, std::size_t size,
                 }
             }
         }
-        if (const auto vision = package.find("vision"); vision != package.end()) {
+        const bool disable_vision = parameters.value("disable_vision", false);
+        if (const auto vision = package.find("vision");
+            vision != package.end() && !disable_vision) {
             if (!vision->is_object() || !vision->contains("mmproj_file") ||
                 !(*vision)["mmproj_file"].is_string()) {
                 llama_model_free(model->model);

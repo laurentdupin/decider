@@ -73,6 +73,12 @@ if(DECIDER_BUILD_HARNESS)
             "${INFERBRIDGE_ROOT}/include"
             "${LLAMA_CPP_ROOT}/vendor")
         target_link_libraries(decider_native_canary PRIVATE inferbridge_decider_harness)
+
+        add_executable(decider_native_jsonl tools/harness_jsonl.cpp)
+        target_compile_features(decider_native_jsonl PRIVATE cxx_std_17)
+        target_include_directories(decider_native_jsonl PRIVATE
+            "${INFERBRIDGE_ROOT}/include")
+        target_link_libraries(decider_native_jsonl PRIVATE inferbridge_decider_harness)
     endif()
 endif()
 
