@@ -148,6 +148,30 @@ the Vulkan shader cache was populated.
 Image dimensions therefore materially affect latency and should be bounded or
 resized by the caller for real-time use.
 
+An aligned 256-by-256 copy of the same image was also checked against a
+Transformers 5.17 BF16 CPU reference with
+`tools/generate_vision_parity_fixture.py`. Text tokens, answer slots, label
+IDs, total text-plus-image token usage, structure, and categorical answer were
+exact. The maximum deltas were `0.12444` for selected logits, `0.000033` for
+probabilities, and `0.0003` across rounded response fields.
+
+```powershell
+python native\inferbridge_decider\tools\generate_vision_parity_fixture.py `
+  C:\models\decider-2b-vision `
+  native\inferbridge_decider\examples\simple_vision_choice.json `
+  C:\images\probe-256.png out\parity\vision-python.json
+python native\inferbridge_decider\tools\compare_parity.py `
+  out\parity\vision-python.json out\parity\vision-native.json `
+  --logit-atol 0.15 --probability-atol 0.001 --response-atol 0.001
+```
+
+For the original 2000-by-840 dimensions, Transformers chooses a 1984-by-832
+grid while the pinned llama.cpp chooses 2016-by-832 at an exact half-step.
+That is an upstream preprocessing-rounding difference, not a language-model
+adapter difference. Use dimensions aligned to the projector's 32-pixel merge
+factor for strict parity fixtures; production inputs remain valid at arbitrary
+dimensions.
+
 Generate the matching Python-side fixture from the original checkpoint with:
 
 ```powershell
