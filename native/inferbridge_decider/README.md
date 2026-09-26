@@ -18,11 +18,14 @@ this repository.
   Python implementation.
 - A pinned llama.cpp dependency capable of loading dense and MoE Qwen3.5 GGUF
   models and returning logits at requested prompt positions.
+- An InferBridge ABI 2 harness with CPU/Vulkan runtime selection, GGUF model
+  loading, asynchronous submission, cancellation, and bounded JSON output.
+- Model-backed plain/state-first inference for independent rows with 2..10
+  options, including per-answer-type temperatures from `decider_config.json`.
 
-The first model-backed slice will support the state-first plain layout and
-sequential independent rows. Chat metadata, wide labels, and verified shared
-prefix state copying are explicit follow-up gates; the harness will reject an
-unsupported model configuration rather than silently use a different prompt.
+Chat metadata, wide labels, packed requests, and verified shared-prefix state
+copying are explicit follow-up gates; the harness rejects an unsupported model
+configuration or request rather than silently using a different prompt.
 
 ## Configure and test the protocol layer
 
@@ -31,6 +34,16 @@ cmake -S native/inferbridge_decider -B out/decider-native-protocol `
   -DDECIDER_BUILD_HARNESS=OFF -DDECIDER_BUILD_TESTS=ON
 cmake --build out/decider-native-protocol --config Release
 ctest --test-dir out/decider-native-protocol -C Release --output-on-failure
+```
+
+Configure the CPU harness and its ABI smoke test with:
+
+```powershell
+cmake -S native/inferbridge_decider -B out/decider-native `
+  -DDECIDER_BUILD_HARNESS=ON -DDECIDER_BUILD_TESTS=ON `
+  -DDECIDER_LLAMA_VULKAN=OFF
+cmake --build out/decider-native --config Release
+ctest --test-dir out/decider-native -C Release --output-on-failure
 ```
 
 `third_party/llama.cpp` is pinned to the revision validated by the existing
