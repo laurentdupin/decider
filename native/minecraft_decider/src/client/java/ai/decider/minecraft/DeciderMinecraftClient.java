@@ -10,6 +10,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -22,6 +23,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -44,6 +47,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.ArrayDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -87,6 +91,13 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private IBaritone baritone;
     private int survivalTargetLogs;
     private boolean survivalGathering;
+    private SurvivalPhase survivalPhase = SurvivalPhase.GATHER_WOOD;
+    private final ArrayDeque<InventoryClick> inventoryClicks = new ArrayDeque<>();
+    private String craftingOperation;
+    private int clickDelay;
+    private int craftingWaitTicks;
+    private int craftingBaseline;
+    private int craftingExpectedGain;
 
     @Override
     public void onInitializeClient() {
@@ -115,7 +126,8 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             return;
         }
         if (isSurvivalTask()) {
-            if (client.gui.screen() != null) {
+            if (client.gui.screen() != null &&
+                !(client.gui.screen() instanceof InventoryScreen)) {
                 releaseControls(client);
                 return;
             }
@@ -202,6 +214,13 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private void resetSurvivalState() {
         survivalTargetLogs = 0;
         survivalGathering = false;
+        survivalPhase = SurvivalPhase.GATHER_WOOD;
+        inventoryClicks.clear();
+        craftingOperation = null;
+        clickDelay = 0;
+        craftingWaitTicks = 0;
+        craftingBaseline = 0;
+        craftingExpectedGain = 0;
         baritone = null;
     }
 
@@ -267,23 +286,33 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             player.sendSystemMessage(Component.literal("Decider error: " + currentFailure));
             LOGGER.error("Decider inference failed: {}", currentFailure);
         }
+        int logs = countInventoryLogs(player);
+        if (survivalPhase == SurvivalPhase.GATHER_WOOD && logs >= 12) {
+            survivalPhase = SurvivalPhase.CRAFT_PLANKS;
+            survivalGathering = false;
+            baritone.getPathingBehavior().cancelEverything();
+            LOGGER.info("Verified survival wood milestone: {} logs", logs);
+        }
+
+        if (!inventoryClicks.isEmpty() || craftingOperation != null) {
+            tickInventoryCrafting(client, player);
+            return;
+        }
+
         Decision decision = nextDecision.getAndSet(null);
         if (decision != null && decision.generation() == sessionGeneration &&
             !survivalGathering) {
             LOGGER.info(String.format(Locale.ROOT,
                 "Decider survival: %s (p=%.3f, %.0f ms)", decision.action(),
                 decision.probability(), decision.latency().toNanos() / 1_000_000.0));
-            applySurvivalAction(player, decision.action());
+            applySurvivalAction(client, player, decision.action());
         }
 
-        int logs = countInventoryLogs(player);
         if (survivalGathering && logs >= survivalTargetLogs) {
             baritone.getPathingBehavior().cancelEverything();
             survivalGathering = false;
-            player.sendSystemMessage(Component.literal(
-                "Decider survival milestone complete: gathered " + logs + " logs"));
             LOGGER.info("Verified survival wood milestone: {} logs", logs);
-            disarmSurvivalMarkers();
+            survivalPhase = SurvivalPhase.CRAFT_PLANKS;
             return;
         }
         if (survivalGathering) return;
@@ -299,22 +328,44 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private JsonObject buildSurvivalRequest(Minecraft client, LocalPlayer player, int logs) {
         JsonObject state = new JsonObject();
         state.addProperty("goal",
-            "Gather enough wood to later craft tools, build a small house, and fuel a furnace.");
-        state.addProperty("phase", "gather_wood");
+            "Gather wood, craft tools, build a small house, and cook chicken in Survival.");
+        state.addProperty("phase", survivalPhase.name().toLowerCase(Locale.ROOT));
         state.addProperty("logs_in_inventory", logs);
+        state.addProperty("planks_in_inventory", countItem(player, Items.OAK_PLANKS) +
+            countItem(player, Items.BIRCH_PLANKS) + countItem(player, Items.SPRUCE_PLANKS) +
+            countItem(player, Items.JUNGLE_PLANKS) + countItem(player, Items.ACACIA_PLANKS) +
+            countItem(player, Items.DARK_OAK_PLANKS) + countItem(player, Items.MANGROVE_PLANKS) +
+            countItem(player, Items.CHERRY_PLANKS));
+        state.addProperty("crafting_tables_in_inventory", countItem(player, Items.CRAFTING_TABLE));
         state.addProperty("nearby_log_blocks", countNearbyLogs(client, player.blockPosition(), 12));
         state.addProperty("health", player.getHealth());
         state.addProperty("hunger", player.getFoodData().getFoodLevel());
 
         JsonObject criteria = new JsonObject();
-        criteria.addProperty("gather_twelve_logs",
-            "Gather twelve logs, enough for basic tools, fuel, and a compact shelter");
-        criteria.addProperty("gather_sixteen_logs",
-            "Gather sixteen logs for a safer material reserve and larger shelter");
+        switch (survivalPhase) {
+            case GATHER_WOOD -> {
+                criteria.addProperty("gather_twelve_logs",
+                    "Gather twelve logs, enough for basic tools, fuel, and a compact shelter");
+                criteria.addProperty("gather_sixteen_logs",
+                    "Gather sixteen logs for a safer material reserve and larger shelter");
+            }
+            case CRAFT_PLANKS -> {
+                criteria.addProperty("craft_four_planks",
+                    "Use one log in the 2x2 inventory grid to make four planks");
+                criteria.addProperty("craft_eight_planks",
+                    "Use two logs in the 2x2 inventory grid to make eight planks");
+            }
+            case CRAFT_TABLE -> {
+                criteria.addProperty("craft_table_now",
+                    "Arrange four planks in the 2x2 grid and take the crafting table");
+                criteria.addProperty("craft_table_carefully",
+                    "Craft one table while preserving all remaining logs and planks");
+            }
+        }
         JsonObject question = new JsonObject();
         question.addProperty("type", "choice");
         question.addProperty("instructions",
-            "Choose a practical wood-gathering target for the survival objective.");
+            "Choose the player action that safely advances the current survival phase.");
         question.add("criteria", criteria);
         JsonObject questions = new JsonObject();
         questions.add("survival", question);
@@ -325,16 +376,135 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         return request;
     }
 
-    private void applySurvivalAction(LocalPlayer player, String action) {
-        if (action.equals("gather_twelve_logs")) survivalTargetLogs = 12;
-        else if (action.equals("gather_sixteen_logs")) survivalTargetLogs = 16;
-        else return;
-        LOGGER.info("Starting player-action wood gathering: target={} logs", survivalTargetLogs);
-        baritone.getMineProcess().mine(survivalTargetLogs,
-            Blocks.OAK_LOG, Blocks.BIRCH_LOG, Blocks.SPRUCE_LOG,
-            Blocks.JUNGLE_LOG, Blocks.ACACIA_LOG, Blocks.DARK_OAK_LOG,
-            Blocks.MANGROVE_LOG, Blocks.CHERRY_LOG);
-        survivalGathering = true;
+    private void applySurvivalAction(Minecraft client, LocalPlayer player, String action) {
+        if (action.equals("gather_twelve_logs") || action.equals("gather_sixteen_logs")) {
+            survivalTargetLogs = action.equals("gather_twelve_logs") ? 12 : 16;
+            LOGGER.info("Starting player-action wood gathering: target={} logs", survivalTargetLogs);
+            baritone.getMineProcess().mine(survivalTargetLogs,
+                Blocks.OAK_LOG, Blocks.BIRCH_LOG, Blocks.SPRUCE_LOG,
+                Blocks.JUNGLE_LOG, Blocks.ACACIA_LOG, Blocks.DARK_OAK_LOG,
+                Blocks.MANGROVE_LOG, Blocks.CHERRY_LOG);
+            survivalGathering = true;
+        } else if (action.equals("craft_four_planks") || action.equals("craft_eight_planks")) {
+            startPlankCrafting(client, player, action.equals("craft_four_planks") ? 1 : 2);
+        } else if (action.equals("craft_table_now") || action.equals("craft_table_carefully")) {
+            startTableCrafting(client, player);
+        }
+    }
+
+    private void startPlankCrafting(Minecraft client, LocalPlayer player, int logCount) {
+        int logSlot = findInventoryMenuSlot(player, true);
+        if (logSlot < 0) {
+            failAndDisarmSurvival(player, "No log stack was available for crafting");
+            return;
+        }
+        client.setScreenAndShow(new InventoryScreen(player));
+        craftingBaseline = countPlanks(player);
+        craftingExpectedGain = logCount * 4;
+        inventoryClicks.add(new InventoryClick(logSlot, 0, ContainerInput.PICKUP, false));
+        for (int count = 0; count < logCount; count++)
+            inventoryClicks.add(new InventoryClick(InventoryMenu.CRAFT_SLOT_START, 1,
+                ContainerInput.PICKUP, false));
+        inventoryClicks.add(new InventoryClick(logSlot, 0, ContainerInput.PICKUP, true));
+        inventoryClicks.add(new InventoryClick(InventoryMenu.RESULT_SLOT, 0,
+            ContainerInput.QUICK_MOVE, false));
+        craftingOperation = "planks";
+        craftingWaitTicks = 0;
+        LOGGER.info("Starting inventory-click crafting: {} log(s) into planks", logCount);
+    }
+
+    private void startTableCrafting(Minecraft client, LocalPlayer player) {
+        int plankSlot = findInventoryMenuSlot(player, false);
+        if (plankSlot < 0 || player.inventoryMenu.getSlot(plankSlot).getItem().getCount() < 4) {
+            failAndDisarmSurvival(player, "No four-plank stack was available for a crafting table");
+            return;
+        }
+        client.setScreenAndShow(new InventoryScreen(player));
+        craftingBaseline = countItem(player, Items.CRAFTING_TABLE);
+        craftingExpectedGain = 1;
+        inventoryClicks.add(new InventoryClick(plankSlot, 0, ContainerInput.PICKUP, false));
+        for (int slot = InventoryMenu.CRAFT_SLOT_START;
+             slot < InventoryMenu.CRAFT_SLOT_END; slot++) {
+            inventoryClicks.add(new InventoryClick(slot, 1, ContainerInput.PICKUP, false));
+        }
+        inventoryClicks.add(new InventoryClick(plankSlot, 0, ContainerInput.PICKUP, true));
+        inventoryClicks.add(new InventoryClick(InventoryMenu.RESULT_SLOT, 0,
+            ContainerInput.QUICK_MOVE, false));
+        craftingOperation = "table";
+        craftingWaitTicks = 0;
+        LOGGER.info("Starting inventory-click crafting: crafting table");
+    }
+
+    private void tickInventoryCrafting(Minecraft client, LocalPlayer player) {
+        if (!inventoryClicks.isEmpty()) {
+            if (++clickDelay < 2) return;
+            clickDelay = 0;
+            InventoryClick click = inventoryClicks.removeFirst();
+            if (click.onlyIfCarried() && player.inventoryMenu.getCarried().isEmpty()) return;
+            client.gameMode.handleContainerInput(player.inventoryMenu.containerId,
+                click.slot(), click.button(), click.input(), player);
+            return;
+        }
+        if (++craftingWaitTicks < 10) return;
+
+        boolean verified = craftingOperation.equals("planks")
+            ? countPlanks(player) >= craftingBaseline + craftingExpectedGain
+            : countItem(player, Items.CRAFTING_TABLE) >= craftingBaseline + 1;
+        if (verified) {
+            LOGGER.info("Verified inventory-click crafting: {}", craftingOperation);
+            if (craftingOperation.equals("planks")) {
+                survivalPhase = SurvivalPhase.CRAFT_TABLE;
+            } else {
+                player.sendSystemMessage(Component.literal(
+                    "Decider survival milestone complete: crafted planks and a crafting table"));
+                LOGGER.info("Verified survival crafting milestone: crafting table in inventory");
+                survivalPhase = SurvivalPhase.COMPLETE;
+                client.setScreenAndShow(null);
+                disarmSurvivalMarkers();
+            }
+            craftingOperation = null;
+            craftingWaitTicks = 0;
+        } else if (craftingWaitTicks >= 60) {
+            failAndDisarmSurvival(player,
+                "Inventory-click crafting did not produce expected " + craftingOperation);
+            craftingOperation = null;
+            client.setScreenAndShow(null);
+        }
+    }
+
+    private static int findInventoryMenuSlot(LocalPlayer player, boolean logs) {
+        for (int slot = InventoryMenu.INV_SLOT_START;
+             slot < InventoryMenu.USE_ROW_SLOT_END; slot++) {
+            ItemStack stack = player.inventoryMenu.getSlot(slot).getItem();
+            if (stack.isEmpty()) continue;
+            if (logs && Block.byItem(stack.getItem()).defaultBlockState().is(BlockTags.LOGS))
+                return slot;
+            if (!logs && isPlank(stack)) return slot;
+        }
+        return -1;
+    }
+
+    private static boolean isPlank(ItemStack stack) {
+        return !stack.isEmpty() && Block.byItem(stack.getItem()).defaultBlockState()
+            .is(BlockTags.PLANKS);
+    }
+
+    private static int countPlanks(LocalPlayer player) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (isPlank(stack)) total += stack.getCount();
+        }
+        return total;
+    }
+
+    private static int countItem(LocalPlayer player, net.minecraft.world.item.Item item) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (!stack.isEmpty() && stack.getItem() == item) total += stack.getCount();
+        }
+        return total;
     }
 
     private static int countInventoryLogs(LocalPlayer player) {
@@ -891,8 +1061,18 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         COMPLETE
     }
 
+    private enum SurvivalPhase {
+        GATHER_WOOD,
+        CRAFT_PLANKS,
+        CRAFT_TABLE,
+        COMPLETE
+    }
+
     private record Decision(String action, double probability, Duration latency,
                             long generation) { }
+
+    private record InventoryClick(int slot, int button, ContainerInput input,
+                                  boolean onlyIfCarried) { }
 
     private record FurnaceSnapshot(int rawChicken, int coal, int cookedChicken,
                                    boolean lit) { }

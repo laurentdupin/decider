@@ -57,7 +57,10 @@ The survival player-action controller uses this additional marker:
 
 Its first verified milestone lets Decider choose a wood target, then delegates
 walking, aiming, and block breaking to Baritone's player-control API. Completion
-is based solely on logs actually present in the player's inventory.
+is based solely on logs actually present in the player's inventory. The next
+phase opens the normal player inventory and performs paced container clicks in
+the 2x2 crafting grid to make planks and a crafting table; it does not inject
+recipes or items.
 
 Create that empty marker only after entering a disposable local Creative
 world. Delete or rename it to disarm the controller. Opening any Minecraft GUI
