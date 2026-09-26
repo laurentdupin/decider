@@ -322,6 +322,37 @@ temperature-calibrated, so its letter logits must not be treated as a validated
 drop-in Decider classifier. A Decider-trained 27B Unsloth quant would need the
 same parity and quality evaluation used for the released 2B and 4B models.
 
+### Public JevBench result
+
+The text-only interface was run through the 231 public tasks in JevBench
+commit `1bcc55eb6c8cffde2306b3db03ede39b61c6152a`, using the RX 9070 and an
+8,192-token context. The persistent JSONL process loads the model once and
+uses JevBench's own `Runner`, scoring, raw-evidence, and summary code.
+
+| Public subset | Correct | Accuracy | Median | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Easy | 48/48 | `1.0000` | `0.227 s` | `0.259 s` |
+| Original | 54/72 | `0.7500` | `0.239 s` | `0.272 s` |
+| Hard | 73/111 | `0.6577` | `1.067 s` | `5.784 s` |
+| All public | 175/231 | `0.7576` | `0.275 s` | `5.161 s` |
+
+All 231 requests completed, all schemas and distributions were valid, and no
+probability map required renormalization. Overall ECE was `0.0692` and mean
+Brier score was `0.3386`. The result JSONL SHA-256 is
+`bc299df517b2cc59e5723697c8d646ed3e9cb8984abef6c79a4732fdd318f6f3`.
+
+This is a public-subset measurement, not an official JevBench leaderboard
+score. The current board also requires sealed decisions and a defensible cost
+basis; neither is available to this local run. The stock Qwen checkpoint caveat
+above also applies to this result.
+
+```powershell
+python native\inferbridge_decider\tools\run_jevbench.py `
+  --model out\models\unsloth-qwen38-27b-iq2xxs\Qwen3.8-27B-UD-IQ2_XXS.gguf `
+  --output-dir out\jevbench\unsloth-qwen38-27b-public-gpu0 `
+  --gpu 0 --context-size 8192
+```
+
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
 `VULKAN` as the final argument only in a build configured with
 `-DDECIDER_LLAMA_VULKAN=ON`; the harness now fails early when no Vulkan GPU

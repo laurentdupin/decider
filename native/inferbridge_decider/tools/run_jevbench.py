@@ -225,7 +225,16 @@ def main() -> int:
     }
     (args.output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(json.dumps({
+        "accuracy": summary["accuracy"],
+        "brier_mean": summary["brier_mean"],
+        "ece": summary["ece"]["ece"],
+        "latency": summary["latency"],
+        "n_attempted": summary["n_attempted"],
+        "n_correct": summary["n_correct"],
+        "operational_success": summary["operational_success"],
+        "schema_validity": summary["schema_validity"],
+    }, indent=2, sort_keys=True))
     return 0 if len(records) == len(tasks) else 3
 
 
