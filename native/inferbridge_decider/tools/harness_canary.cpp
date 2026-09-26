@@ -95,7 +95,7 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--image FILE] [--diagnostics] [--timing] [--output FILE]\n";
+        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--image FILE] [--model-parameters JSON] [--diagnostics] [--timing] [--output FILE]\n";
         return 2;
     }
     try {
@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
         bool timing = false;
         std::string output_path;
         std::string image_path;
+        std::string model_parameters;
         for (int index = 3; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--diagnostics") {
@@ -116,6 +117,8 @@ int main(int argc, char** argv) {
                 output_path = argv[++index];
             } else if (argument == "--image" && index + 1 < argc) {
                 image_path = argv[++index];
+            } else if (argument == "--model-parameters" && index + 1 < argc) {
+                model_parameters = argv[++index];
             } else if (argument == "CPU" || argument == "VULKAN") {
                 backend = argument;
             } else {
@@ -143,6 +146,7 @@ int main(int argc, char** argv) {
             model_request.struct_size = sizeof(model_request);
             model_request.api_version = IBRH_CURRENT_API_VERSION;
             model_request.model_path = view(model_path);
+            model_request.parameters_json = view(model_parameters);
             const auto load_started = std::chrono::steady_clock::now();
             check(api, api.model_load(runtime, sizeof(model_request), &model_request, &model),
                   runtime, "model_load");
