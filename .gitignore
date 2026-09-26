@@ -9,3 +9,4 @@ __pycache__/
 .nfs*
 dist/
 build/
+/out/
