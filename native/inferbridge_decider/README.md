@@ -150,24 +150,32 @@ the PyTorch and llama.cpp kernels.
 
 ## Vulkan status
 
-The Vulkan build was exercised with the BF16 v11 GGUF on an NVIDIA GeForce GTX
-1080 8 GB. All ABI/protocol tests passed, and the packed conformance probe
-remained within the CPU/Python parity envelope: maximum deltas were `0.07722`
-logits, `0.00413` probabilities, and `0.0042` across rounded response fields.
+The Vulkan build was exercised with the BF16 v11 GGUF on an AMD Radeon RX 9070,
+an AMD Radeon RX 6700 XT, and an NVIDIA GeForce GTX 1080. All ABI/protocol tests
+passed. Each GPU was isolated with `GGML_VK_VISIBLE_DEVICES`; without that
+variable llama.cpp exposes every supported discrete GPU and may split model
+layers among them.
 
-After the Vulkan driver shader cache was populated, five fresh-process runs of
-each simple example produced these median inference times:
+After each driver's shader cache was populated, three fresh-process runs per
+GPU and example produced these median inference times:
 
-| Example | Result | Vulkan inference | CPU inference |
-| --- | --- | ---: | ---: |
-| `simple_choice.json` | `billing` (`p=0.9703`) | `63.37 ms` | `605.16 ms` |
-| `simple_noul.json` | `0.7912` | `57.47 ms` | `593.73 ms` |
-| `simple_score.json` | `1.32` | `51.45 ms` | `608.35 ms` |
+| Example | Result | RX 9070 | RX 6700 XT | GTX 1080 | CPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `simple_choice.json` | `billing` (`p=0.9703`) | `54.76 ms` | `106.93 ms` | `146.23 ms` | `605.16 ms` |
+| `simple_noul.json` | `0.7912` | `45.46 ms` | `100.40 ms` | `149.79 ms` | `593.73 ms` |
+| `simple_score.json` | `1.32` | `55.67 ms` | `112.57 ms` | `124.83 ms` | `608.35 ms` |
 
-Fresh canary processes took about `2.34`–`2.38 s` to load the model. InferBridge
-keeps the loaded runtime alive, so this is startup cost rather than per-request
-latency. The first inference on a machine can additionally compile/cache Vulkan
-pipelines; the measured first uncached request took `1.11 s`.
+The packed conformance probe passed against the Python BF16 fixture on every
+GPU. Maximum `(logit, probability, rounded-response)` deltas were
+`(0.07722, 0.00413, 0.0042)` on the RX 9070,
+`(0.08388, 0.00501, 0.005)` on the RX 6700 XT, and
+`(0.08272, 0.00346, 0.01)` on the GTX 1080.
+
+Fresh canary model loads were about `2.28`–`2.31 s` on the RX 9070,
+`2.40`–`2.43 s` on the RX 6700 XT, and `3.09`–`3.12 s` on the GTX 1080.
+InferBridge keeps the loaded runtime alive, so this is startup cost rather than
+per-request latency. The first inference for a new GPU/kernel shape can be much
+slower while the driver compiles and caches Vulkan pipelines.
 
 Run a timed Vulkan decision with:
 
@@ -176,6 +184,14 @@ out\decider-native-vulkan\Release\decider_native_canary.exe `
   C:\models\decider-2b-native\decider-2b-bf16.gguf `
   native\inferbridge_decider\examples\simple_choice.json `
   VULKAN --timing
+```
+
+To pin an InferBridge process to one physical Vulkan device, set the zero-based
+device index before process startup. Obtain the indices from
+`vulkaninfo --summary`:
+
+```powershell
+$env:GGML_VK_VISIBLE_DEVICES = '0'
 ```
 
 The checkpoint's `decider_config.json` must remain beside the GGUF file. Use
