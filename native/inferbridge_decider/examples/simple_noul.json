@@ -1,0 +1,10 @@
+{
+  "state": "The customer asks for their duplicate card charge to be returned.",
+  "questions": {
+    "refund_requested": {
+      "type": "noul",
+      "instructions": "Is the customer requesting a refund?"
+    }
+  },
+  "independent": true
+}

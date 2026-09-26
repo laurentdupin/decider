@@ -1,0 +1,15 @@
+{
+  "state": "The customer was charged twice for one order.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this request?",
+      "criteria": {
+        "billing": "Charges, invoices, and refunds",
+        "technical_support": "Product errors and troubleshooting",
+        "sales": "Pricing and purchasing questions"
+      }
+    }
+  },
+  "independent": true
+}

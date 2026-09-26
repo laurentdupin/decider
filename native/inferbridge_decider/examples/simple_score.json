@@ -1,0 +1,16 @@
+{
+  "state": "Checkout is unavailable for every customer in Europe.",
+  "questions": {
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is this incident?",
+      "criteria": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "isolated": false
+    }
+  },
+  "independent": true
+}

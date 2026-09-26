@@ -72,7 +72,7 @@ ibrh_transfer_binding binding(ibrh_resource resource) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics] [--output FILE]\n";
+        std::cerr << "usage: decider_native_canary MODEL.gguf REQUEST.json [CPU|VULKAN] [--diagnostics] [--timing] [--output FILE]\n";
         return 2;
     }
     try {
@@ -80,11 +80,14 @@ int main(int argc, char** argv) {
         std::string request_json = read_file(argv[2]);
         std::string backend = "CPU";
         bool diagnostics = false;
+        bool timing = false;
         std::string output_path;
         for (int index = 3; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--diagnostics") {
                 diagnostics = true;
+            } else if (argument == "--timing") {
+                timing = true;
             } else if (argument == "--output" && index + 1 < argc) {
                 output_path = argv[++index];
             } else if (argument == "CPU" || argument == "VULKAN") {
@@ -114,8 +117,10 @@ int main(int argc, char** argv) {
             model_request.struct_size = sizeof(model_request);
             model_request.api_version = IBRH_CURRENT_API_VERSION;
             model_request.model_path = view(model_path);
+            const auto load_started = std::chrono::steady_clock::now();
             check(api, api.model_load(runtime, sizeof(model_request), &model_request, &model),
                   runtime, "model_load");
+            const auto load_finished = std::chrono::steady_clock::now();
 
             ibrh_resource input_resource =
                 host_json(request_json.data(), request_json.size(), IBRH_RESOURCE_ACCESS_READ);
@@ -141,6 +146,7 @@ int main(int argc, char** argv) {
             submit.output_count = 1;
             submit.source_frame_id = 1;
             submit.parameters_json = view(submit_parameters);
+            const auto inference_started = std::chrono::steady_clock::now();
             check(api, api.submit(model, sizeof(submit), &submit, &job), model, "submit");
 
             for (;;) {
@@ -151,12 +157,21 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("native inference failed: " + last_error(api, job));
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
+            const auto inference_finished = std::chrono::steady_clock::now();
             if (output_path.empty()) {
                 std::cout << output.data() << '\n';
             } else {
                 std::ofstream file(output_path, std::ios::binary);
                 if (!file) throw std::runtime_error("cannot open output file: " + output_path);
                 file << output.data() << '\n';
+            }
+            if (timing) {
+                const auto load_ms = std::chrono::duration<double, std::milli>(
+                    load_finished - load_started).count();
+                const auto inference_ms = std::chrono::duration<double, std::milli>(
+                    inference_finished - inference_started).count();
+                std::cerr << "TIMING model_load_ms=" << load_ms
+                          << " inference_ms=" << inference_ms << '\n';
             }
             api.job_release(job);
             job = nullptr;
