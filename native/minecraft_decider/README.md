@@ -22,7 +22,13 @@ native\minecraft_decider\gradlew.bat -p native\minecraft_decider build
 ```
 
 The project targets Minecraft 26.3, Fabric Loader 0.19.5, Fabric API
-0.161.0+26.3, Loom 1.17, and Java 25.
+0.161.0+26.3, Baritone 1.20.0, Loom 1.17, and Java 25. Baritone is used only
+through its API as a player-input pathfinder and miner; its chat commands and
+builder/world-edit interfaces are not used.
+
+Download the official `baritone-api-fabric-1.20.0.jar` release into
+`out/dependencies` before building. Its expected SHA-256 is
+`49adfc063cfbfd0b6f08e9d814359807baa2d1768c0d39d6c5968268547cbca6`.
 
 ## Local configuration
 
@@ -42,6 +48,16 @@ The legacy marker below is rejected and automatically removed:
 ```text
 .minecraft\config\decider-house-chicken.enabled
 ```
+
+The survival player-action controller uses this additional marker:
+
+```text
+.minecraft\config\decider-survival.enabled
+```
+
+Its first verified milestone lets Decider choose a wood target, then delegates
+walking, aiming, and block breaking to Baritone's player-control API. Completion
+is based solely on logs actually present in the player's inventory.
 
 Create that empty marker only after entering a disposable local Creative
 world. Delete or rename it to disarm the controller. Opening any Minecraft GUI

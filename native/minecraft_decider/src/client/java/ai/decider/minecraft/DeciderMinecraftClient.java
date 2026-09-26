@@ -1,5 +1,7 @@
 package ai.decider.minecraft;
 
+import baritone.api.BaritoneAPI;
+import baritone.api.IBaritone;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -12,6 +14,7 @@ import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
@@ -81,6 +84,9 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private final AtomicReference<Boolean> transferResult = new AtomicReference<>();
     private volatile long sessionGeneration;
     private boolean wasArmed;
+    private IBaritone baritone;
+    private int survivalTargetLogs;
+    private boolean survivalGathering;
 
     @Override
     public void onInitializeClient() {
@@ -101,8 +107,22 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             wasArmed = true;
             sessionGeneration++;
             if (isHouseChickenTask()) resetTaskState();
+            if (isSurvivalTask()) resetSurvivalState();
         }
-        if (player == null || client.level == null || client.gui.screen() != null) {
+        if (player == null || client.level == null) {
+            releaseControls(client);
+            announced = false;
+            return;
+        }
+        if (isSurvivalTask()) {
+            if (client.gui.screen() != null) {
+                releaseControls(client);
+                return;
+            }
+            onSurvivalTick(client, player);
+            return;
+        }
+        if (client.gui.screen() != null) {
             releaseControls(client);
             announced = false;
             return;
@@ -157,6 +177,7 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         sessionGeneration++;
         nextDecision.set(null);
         awaitingVerification = false;
+        if (baritone != null) baritone.getPathingBehavior().cancelEverything();
         inference.submit(() -> {
             if (runner != null) runner.close();
             runner = null;
@@ -178,6 +199,12 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
         transferResult.set(null);
     }
 
+    private void resetSurvivalState() {
+        survivalTargetLogs = 0;
+        survivalGathering = false;
+        baritone = null;
+    }
+
     private static boolean isArmed() {
         return Files.isRegularFile(FabricLoader.getInstance().getConfigDir()
             .resolve("decider-autopilot.enabled"));
@@ -186,6 +213,11 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
     private static boolean isHouseChickenTask() {
         return Files.isRegularFile(FabricLoader.getInstance().getConfigDir()
             .resolve("decider-house-chicken.enabled"));
+    }
+
+    private static boolean isSurvivalTask() {
+        return Files.isRegularFile(FabricLoader.getInstance().getConfigDir()
+            .resolve("decider-survival.enabled"));
     }
 
     private void decide(JsonObject request, String questionName, long generation) {
@@ -207,6 +239,142 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             runner = null;
         } finally {
             requestPending.set(false);
+        }
+    }
+
+    private void onSurvivalTick(Minecraft client, LocalPlayer player) {
+        releaseControls(client);
+        if (player.isCreative() || player.isSpectator()) {
+            failAndDisarmSurvival(player,
+                "Survival task requires a Survival-mode player");
+            return;
+        }
+        if (!announced) {
+            player.sendSystemMessage(Component.literal(
+                "Decider 4B survival task armed: gather wood using player actions"));
+            LOGGER.info("Decider survival task armed");
+            announced = true;
+        }
+        if (baritone == null)
+            baritone = BaritoneAPI.getProvider().getBaritoneForPlayer(player);
+        if (baritone == null) {
+            failAndDisarmSurvival(player, "Baritone did not attach to the local player");
+            return;
+        }
+
+        String currentFailure = failure.getAndSet(null);
+        if (currentFailure != null) {
+            player.sendSystemMessage(Component.literal("Decider error: " + currentFailure));
+            LOGGER.error("Decider inference failed: {}", currentFailure);
+        }
+        Decision decision = nextDecision.getAndSet(null);
+        if (decision != null && decision.generation() == sessionGeneration &&
+            !survivalGathering) {
+            LOGGER.info(String.format(Locale.ROOT,
+                "Decider survival: %s (p=%.3f, %.0f ms)", decision.action(),
+                decision.probability(), decision.latency().toNanos() / 1_000_000.0));
+            applySurvivalAction(player, decision.action());
+        }
+
+        int logs = countInventoryLogs(player);
+        if (survivalGathering && logs >= survivalTargetLogs) {
+            baritone.getPathingBehavior().cancelEverything();
+            survivalGathering = false;
+            player.sendSystemMessage(Component.literal(
+                "Decider survival milestone complete: gathered " + logs + " logs"));
+            LOGGER.info("Verified survival wood milestone: {} logs", logs);
+            disarmSurvivalMarkers();
+            return;
+        }
+        if (survivalGathering) return;
+
+        if (++tick % 20 == 0 && System.nanoTime() >= retryAfterNanos &&
+            requestPending.compareAndSet(false, true)) {
+            JsonObject request = buildSurvivalRequest(client, player, logs);
+            long generation = sessionGeneration;
+            inference.submit(() -> decide(request, "survival", generation));
+        }
+    }
+
+    private JsonObject buildSurvivalRequest(Minecraft client, LocalPlayer player, int logs) {
+        JsonObject state = new JsonObject();
+        state.addProperty("goal",
+            "Gather enough wood to later craft tools, build a small house, and fuel a furnace.");
+        state.addProperty("phase", "gather_wood");
+        state.addProperty("logs_in_inventory", logs);
+        state.addProperty("nearby_log_blocks", countNearbyLogs(client, player.blockPosition(), 12));
+        state.addProperty("health", player.getHealth());
+        state.addProperty("hunger", player.getFoodData().getFoodLevel());
+
+        JsonObject criteria = new JsonObject();
+        criteria.addProperty("gather_twelve_logs",
+            "Gather twelve logs, enough for basic tools, fuel, and a compact shelter");
+        criteria.addProperty("gather_sixteen_logs",
+            "Gather sixteen logs for a safer material reserve and larger shelter");
+        JsonObject question = new JsonObject();
+        question.addProperty("type", "choice");
+        question.addProperty("instructions",
+            "Choose a practical wood-gathering target for the survival objective.");
+        question.add("criteria", criteria);
+        JsonObject questions = new JsonObject();
+        questions.add("survival", question);
+        JsonObject request = new JsonObject();
+        request.add("state", state);
+        request.add("questions", questions);
+        request.addProperty("independent", true);
+        return request;
+    }
+
+    private void applySurvivalAction(LocalPlayer player, String action) {
+        if (action.equals("gather_twelve_logs")) survivalTargetLogs = 12;
+        else if (action.equals("gather_sixteen_logs")) survivalTargetLogs = 16;
+        else return;
+        LOGGER.info("Starting player-action wood gathering: target={} logs", survivalTargetLogs);
+        baritone.getMineProcess().mine(survivalTargetLogs,
+            Blocks.OAK_LOG, Blocks.BIRCH_LOG, Blocks.SPRUCE_LOG,
+            Blocks.JUNGLE_LOG, Blocks.ACACIA_LOG, Blocks.DARK_OAK_LOG,
+            Blocks.MANGROVE_LOG, Blocks.CHERRY_LOG);
+        survivalGathering = true;
+    }
+
+    private static int countInventoryLogs(LocalPlayer player) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (!stack.isEmpty() && Block.byItem(stack.getItem()).defaultBlockState()
+                .is(BlockTags.LOGS)) total += stack.getCount();
+        }
+        return total;
+    }
+
+    private static int countNearbyLogs(Minecraft client, BlockPos center, int radius) {
+        int count = 0;
+        for (int x = -radius; x <= radius; x++) {
+            for (int y = -6; y <= 10; y++) {
+                for (int z = -radius; z <= radius; z++) {
+                    if (client.level.getBlockState(center.offset(x, y, z)).is(BlockTags.LOGS))
+                        count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private void failAndDisarmSurvival(LocalPlayer player, String message) {
+        player.sendSystemMessage(Component.literal("Decider error: " + message));
+        LOGGER.error(message);
+        if (baritone != null) baritone.getPathingBehavior().cancelEverything();
+        disarmSurvivalMarkers();
+    }
+
+    private void disarmSurvivalMarkers() {
+        try {
+            Files.deleteIfExists(FabricLoader.getInstance().getConfigDir()
+                .resolve("decider-survival.enabled"));
+            Files.deleteIfExists(FabricLoader.getInstance().getConfigDir()
+                .resolve("decider-autopilot.enabled"));
+        } catch (IOException exception) {
+            LOGGER.warn("Could not disarm survival task", exception);
         }
     }
 
