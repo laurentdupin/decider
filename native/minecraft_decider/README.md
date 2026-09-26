@@ -10,12 +10,10 @@ It can walk, steer, turn, jump, or stop. It cannot mine, attack, craft, use
 items, or join servers automatically. It releases all controls whenever a GUI
 or pause screen is open and forces `stop` below six health.
 
-An experimental local-Creative task mode is also available. When both arming
-markers exist, Decider selects bounded, phase-appropriate skills to choose a
-material, build a small house, place and load a furnace, and collect one cooked
-chicken. The repetitive building operations are guarded command macros rather
-than individual mouse actions. Every phase is verified against client world
-state or authoritative integrated-server furnace state before it can advance.
+The earlier command-macro task is retained only as historical prototype code
+and is disabled at runtime. Current policy permits only player-equivalent
+controls: movement, camera rotation, attack/use, hotbar selection, and normal
+inventory or container clicks. World and server access must remain read-only.
 
 ## Build
 
@@ -39,7 +37,7 @@ The mod is disarmed unless this file exists:
 .minecraft\config\decider-autopilot.enabled
 ```
 
-To select the house-and-chicken task, also create:
+The legacy marker below is rejected and automatically removed:
 
 ```text
 .minecraft\config\decider-house-chicken.enabled

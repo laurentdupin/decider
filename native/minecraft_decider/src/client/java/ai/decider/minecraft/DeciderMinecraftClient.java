@@ -108,7 +108,8 @@ public final class DeciderMinecraftClient implements ClientModInitializer {
             return;
         }
         if (isHouseChickenTask()) {
-            onHouseChickenTick(client, player);
+            failAndDisarm(player,
+                "Legacy command-macro tasks are disabled; use player-control skills");
             return;
         }
         if (!announced) {
